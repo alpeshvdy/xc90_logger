@@ -13,6 +13,7 @@ from config import (
     IDLE_POLL_INTERVAL,
     BLE_RETRY_LIMIT,
     FW_VERSION,
+    KNOWN_ICAR_PRO_MACS
 )
 from pids import PIDS_BY_TIER
 from obd import OBDClient
@@ -275,6 +276,12 @@ async def main():
     # Run forever — tasks handle their own loops
     try:
         await asyncio.gather(*tasks)
+    except KeyboardInterrupt:
+        print("[main] Shutdown requested — flushing buffer...")
+        log_buffer.flush()
+        print("[main] Attempting upload before exit...")
+        upload_pending(wifi_manager, log_buffer.log_file)
+        print("[main] Shutdown complete")
     except Exception as e:
         print(f"[main] Task error: {e}")
         # Flush buffer before any crash

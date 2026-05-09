@@ -302,7 +302,8 @@ def build_row(trip_manager, decoded_values, sample_tier, raw_pid, raw_response, 
         "oil_pressure_kpa":   all_values.get("oil_pressure_kpa", ""),
         # Raw + metadata
         "raw_pid":            raw_pid,
-        "raw_response":       raw_response,
+        # Sanitize raw_response: replace \r/\n with space so CSV rows stay on single lines
+        "raw_response":       (raw_response or "").replace("\r", " ").replace("\n", " "),
         "decode_status":      decode_status,
         "sample_tier":        sample_tier,
         "fw_version":         FW_VERSION,

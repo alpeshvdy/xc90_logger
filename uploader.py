@@ -66,16 +66,34 @@ def _get_pending_files(active_log_file):
     except Exception:
         return []
 
+    # Normalize active_log_file: strip leading './' if present
+    # so "./logs/xc90_001.csv" matches "/logs/xc90_001.csv"
+    normalized_active = active_log_file
+    if normalized_active.startswith("./"):
+        normalized_active = normalized_active[2:]
+
+    print(f"[uploader] Debug — active_file: '{active_log_file}' → normalized: '{normalized_active}'")
+    print(f"[uploader] Debug — uploaded tracker: {list(uploaded.keys())}")
+    print(f"[uploader] Debug — CSV files in /logs/: {sorted([f for f in all_files if f.endswith('.csv')])}")
+
     for fname in sorted(all_files):
         if not fname.endswith(".csv"):
             continue
         full_path = f"{LOG_DIR}/{fname}"
-        if full_path == active_log_file:
+        # Strip ./ from full_path too for consistent comparison
+        normalized_full = full_path
+        if normalized_full.startswith("./"):
+            normalized_full = normalized_full[2:]
+        if normalized_full == normalized_active:
+            print(f"[uploader] Debug — skipping active file: {full_path}")
             continue          # never touch active file
-        if full_path in uploaded:
+        if full_path in uploaded or normalized_full in uploaded:
+            print(f"[uploader] Debug — skipping already uploaded: {full_path}")
             continue          # already uploaded
         pending.append(full_path)
+        print(f"[uploader] Debug — added pending: {full_path}")
 
+    print(f"[uploader] Debug — pending count: {len(pending)}")
     return pending
 
 
@@ -178,8 +196,10 @@ def _upload_file(filepath):
 
     headers = header_line.split(",")
 
-    for i in range(0, len(data_lines), 10):
-        batch = data_lines[i:i + 10]
+    # Upload in small batches to avoid ESP32 memory pressure
+    BATCH_SIZE = 5
+    for i in range(0, len(data_lines), BATCH_SIZE):
+        batch = data_lines[i:i + BATCH_SIZE]
         rows  = []
 
         for line in batch:
@@ -191,10 +211,19 @@ def _upload_file(filepath):
         if not rows:
             continue
 
+        # Debug: print first batch JSON so we can see exactly what's being rejected
+        if i == 0:
+            payload = json.dumps({"rows": rows})
+            print(f"[uploader] Debug — JSON payload ({len(payload)} bytes)")
+            # Print in chunks so nothing is truncated
+            for start in range(0, len(payload), 200):
+                print(f"[uploader]   {payload[start:start+200]}")
+
         try:
+            payload = json.dumps({"rows": rows})
             response = urequests.post(
                 SHEETS_WEBHOOK_URL,
-                data=json.dumps({"rows": rows}),
+                data=payload,
                 headers={"Content-Type": "application/json"},
                 timeout=SHEETS_TIMEOUT,
             )
@@ -202,13 +231,13 @@ def _upload_file(filepath):
                 success += len(rows)
             else:
                 print(f"[uploader] HTTP {response.status_code} "
-                      f"on batch {i // 10 + 1}")
+                      f"on batch {i // BATCH_SIZE + 1}")
                 errors += len(rows)
             response.close()
 
         except Exception as e:
             print(f"[uploader] POST error batch "
-                  f"{i // 10 + 1}: {e}")
+                  f"{i // BATCH_SIZE + 1}: {e}")
             errors += len(rows)
 
         time.sleep(0.2)  # breathing room between batches
@@ -297,6 +326,16 @@ def upload_pending(wifi_manager, active_log_file):
     # Find files to upload
     pending = _get_pending_files(active_log_file)
     if not pending:
+        # Debug: show why no pending files found
+        uploaded = _load_uploaded()
+        try:
+            all_files = os.listdir(LOG_DIR)
+        except Exception:
+            all_files = []
+        csv_files = [f for f in all_files if f.endswith(".csv")]
+        print(f"[uploader] Debug — csv files in /logs/: {csv_files}")
+        print(f"[uploader] Debug — uploaded tracker: {list(uploaded.keys())}")
+        print(f"[uploader] Debug — active file: {active_log_file}")
         print("[uploader] Nothing to upload")
         return 0
 

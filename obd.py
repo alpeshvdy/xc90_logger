@@ -16,6 +16,7 @@ from config import (
     ICAR_SERVICE_UUID,
     ICAR_WRITE_CHAR_UUID,
     ICAR_NOTIFY_CHAR_UUID,
+    KNOWN_ICAR_PRO_MACS,
 )
 from pids import QUERYABLE_PIDS, ENHANCED_PIDS
 from decoder import decode, RESPONSE_UNSUPPORTED
@@ -99,12 +100,16 @@ class OBDClient:
         if event == _IRQ_SCAN_RESULT:
             addr_type, addr, adv_type, rssi, adv_data = data
             name = self._parse_adv_name(adv_data)
+            # Debug: log ALL discovered devices
+            addr_str = ':'.join(f'{b:02X}' for b in addr)
+            print(f"[obd] SCAN → {name or '(no name)':20s}  "
+                  f"addr:{addr_str}  RSSI:{rssi}  type:{adv_type}")
             if name and (
                 ICAR_DEVICE_NAME_IOS in name or
                 ICAR_DEVICE_NAME_ANDROID in name
             ):
                 self._scan_result = bytes(addr), addr_type
-                print(f"[obd] Found: {name} RSSI:{rssi}")
+                print(f"[obd] ★ MATCH: {name} RSSI:{rssi}")
 
         elif event == _IRQ_SCAN_DONE:
             self._scan_done = True
@@ -126,7 +131,10 @@ class OBDClient:
 
         elif event == _IRQ_GATTC_SERVICE_RESULT:
             conn_handle, start_handle, end_handle, uuid = data
-            if str(uuid) == ICAR_SERVICE_UUID:
+            uuid_str = str(uuid)
+            print("[obd] Service discovered: %s  handle:%d-%d" % (uuid_str, start_handle, end_handle))
+            # Handle both full UUID string ("000018f0-...") and short form (UUID(0x18F0))
+            if uuid_str == ICAR_SERVICE_UUID or ('18f0' in uuid_str and '000018f0' in ICAR_SERVICE_UUID):
                 self._service_start = start_handle
                 self._service_end   = end_handle
 
@@ -136,10 +144,19 @@ class OBDClient:
         elif event == _IRQ_GATTC_CHARACTERISTIC_RESULT:
             conn_handle, def_handle, value_handle, props, uuid = data
             uuid_str = str(uuid)
-            if uuid_str == ICAR_WRITE_CHAR_UUID:
+            print("[obd] Char found: %s  handle:%d  props:%d" % (uuid_str, value_handle, props))
+            # Try full UUID string match first, then short-form match (UUID(0x2AF1) vs 00002AF1...)
+            matched = False
+            if uuid_str == ICAR_WRITE_CHAR_UUID or '2af1' in uuid_str.lower():
                 self._write_handle  = value_handle
-            elif uuid_str == ICAR_NOTIFY_CHAR_UUID:
+                print("[obd]   → matched WRITE char")
+                matched = True
+            elif uuid_str == ICAR_NOTIFY_CHAR_UUID or '2af0' in uuid_str.lower():
                 self._notify_handle = value_handle
+                print("[obd]   → matched NOTIFY char")
+                matched = True
+            if not matched:
+                print("[obd]   (no config match - props:%d)" % props)
 
         elif event == _IRQ_GATTC_CHARACTERISTIC_DONE:
             self._chars_done = True
@@ -182,18 +199,21 @@ class OBDClient:
     def scan(self):
         """
         Scan for iCar Pro BLE device.
+        First tries to find by name via active scan.
+        Falls back to known MAC addresses if name not found.
         Returns (addr, addr_type) if found, None if timed out.
         """
         print("[obd] Scanning for iCar Pro...")
         self._scan_result = None
         self._scan_done   = False
 
-        # Scan params: interval=50ms, window=30ms, active scan
+        # Longer scan with better params for BLE 4.0 devices
+        # interval=100ms, window=50ms, active scan
         self._ble.gap_scan(
-            BLE_SCAN_TIMEOUT * 1000,  # duration ms
-            50000,                     # interval us
-            30000,                     # window us
-            True                       # active scan
+            BLE_SCAN_TIMEOUT * 1000,  # duration in ms (from config, 10s default)
+            100000,       # interval 100ms (slower but more likely to catch BLE 4.0)
+            50000,        # window 50ms
+            True          # active scan (request scan response)
         )
 
         start = time.time()
@@ -201,14 +221,31 @@ class OBDClient:
             if self._scan_result:
                 self._ble.gap_scan(None)  # stop scan
                 return self._scan_result
-            if (time.time() - start) > BLE_SCAN_TIMEOUT:
+            if (time.time() - start) > 15:
                 self._ble.gap_scan(None)
-                print("[obd] Scan timed out — iCar Pro not found")
-                return None
+                time.sleep(0.5)  # let scan fully stop before connecting
+                break
             time.sleep(0.1)
 
-        if self._scan_result:
-            return self._scan_result
+        # Name not found — try known MAC addresses
+        print("[obd] Name not found, trying known MAC addresses...")
+        for known_mac in KNOWN_ICAR_PRO_MACS:
+            addr = bytes(known_mac)
+            addr_str = ':'.join('%02X' % b for b in addr)
+            print("[obd] Attempting connection to known MAC: %s" % addr_str)
+            # Try to connect — this tells us if the device is reachable
+            self._connecting = True
+            self._ble.gap_connect(1, addr)  # addr_type=1 (random - most BLE OBD adapters use random addresses)
+            # Wait up to 5 seconds for connection
+            conn_start = time.time()
+            while self._connecting and (time.time() - conn_start) < 5:
+                time.sleep(0.1)
+            if self._connected:
+                print("[obd] Connected via known MAC: %s" % addr_str)
+                self._scan_result = (addr, 0)
+                return self._scan_result
+            else:
+                print("[obd] Known MAC %s unreachable" % addr_str)
 
         print("[obd] iCar Pro not found in scan")
         return None
@@ -232,20 +269,25 @@ class OBDClient:
             return False
 
         addr, addr_type = scan_result
-        print("[obd] Connecting...")
-        self._connecting = True
-        self._ble.gap_connect(addr_type, addr)
 
-        # Wait for connection
-        start = time.time()
-        while self._connecting:
-            if (time.time() - start) > BLE_CONNECT_TIMEOUT:
-                print("[obd] Connection timed out")
-                return False
-            time.sleep(0.1)
-
+        # Skip connect if already connected via fallback MAC (in scan())
         if not self._connected:
-            return False
+            print("[obd] Connecting...")
+            self._connecting = True
+            self._ble.gap_connect(addr_type, addr)
+
+            # Wait for connection
+            start = time.time()
+            while self._connecting:
+                if (time.time() - start) > BLE_CONNECT_TIMEOUT:
+                    print("[obd] Connection timed out")
+                    return False
+                time.sleep(0.1)
+
+            if not self._connected:
+                return False
+        else:
+            print("[obd] Already connected via fallback MAC, proceeding...")
 
         # Discover services
         if not self._discover_services():
@@ -313,8 +355,13 @@ class OBDClient:
             time.sleep(0.1)
 
         if self._write_handle is None or self._notify_handle is None:
-            print("[obd] Required characteristics not found")
-            return False
+            # Handle single-characteristic devices (FFE1 used for both write and notify)
+            if self._write_handle is not None and self._notify_handle is None:
+                print("[obd] Single char device - using write handle for notify")
+                self._notify_handle = self._write_handle
+            else:
+                print("[obd] Required characteristics not found")
+                return False
 
         print(f"[obd] Write:{self._write_handle} "
               f"Notify:{self._notify_handle}")

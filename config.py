@@ -7,21 +7,30 @@ WIFI_PASSWORD = "House@77"
 WIFI_TIMEOUT = 10  # seconds to wait before giving up
 
 # Google Sheets
-SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxv7BF0EBcQeDzTyMwFSVlUZY2sE44MUBTbGaUt_Ziuww7kBAvQhgu4cIuLcoTr23ja/exec"
+SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbw541WzGCItgElGK2Ddu7h1Yvfw8WtQvE3FOXuck2ubxM4lVOich8G8zrSKjuyXZEGq/exec"
 SHEETS_TIMEOUT = 5  # seconds before giving up on upload
 
 # BLE / iCar Pro
-ICAR_DEVICE_NAME_IOS     = "IOS-VLink"
-ICAR_DEVICE_NAME_ANDROID = "ANDROID-VLink"
+ICAR_DEVICE_NAME_IOS     = "IOS-Vlink"
+ICAR_DEVICE_NAME_ANDROID = "ANDROID-Vlink"
 BLE_SCAN_TIMEOUT = 10      # seconds to scan before giving up
 BLE_CONNECT_TIMEOUT = 10   # seconds to wait for connection
 BLE_RETRY_LIMIT = 3        # how many times to retry on failure
 
+# Known iCar Pro MAC addresses (from BLE scans)
+# If name-based discovery fails, we try connecting to these directly
+KNOWN_ICAR_PRO_MACS = [
+    (0xD2, 0xE0, 0x2F, 0x8D, 0x5A, 0x04),  # Primary known MAC
+]
+
 # iCar Pro BLE service and characteristic UUIDs
-# These are Vgate's published UUIDs for ELM327 BLE protocol
-ICAR_SERVICE_UUID    = "0000fff0-0000-1000-8000-00805f9b34fb"
-ICAR_WRITE_CHAR_UUID = "0000fff2-0000-1000-8000-00805f9b34fb"
-ICAR_NOTIFY_CHAR_UUID= "0000fff1-0000-1000-8000-00805f9b34fb"
+# Discovered via service & characteristic discovery on actual device:
+# Service: 0x18F0 (ELM327 OBD service)
+# Write Char: 0x2AF1 (handle 14, props: Write + Write Without Response)
+# Notify Char: 0x2AF0 (handle 11, props: Notify + Indicate)
+ICAR_SERVICE_UUID    = "000018f0-0000-1000-8000-00805f9b34fb"
+ICAR_WRITE_CHAR_UUID = "00002af1-0000-1000-8000-00805f9b34fb"
+ICAR_NOTIFY_CHAR_UUID= "00002af0-0000-1000-8000-00805f9b34fb"
 
 # Sampling intervals in milliseconds
 SAMPLE_RATE_CRITICAL = 1000   # RPM, coolant, boost — every 1 second
