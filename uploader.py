@@ -5,13 +5,14 @@
 # ============================================================
 
 import network
-import urequests
+import usocket
+import ssl
 import os
 import json
 import time
 from config import (
     WIFI_SSID, WIFI_PASSWORD, WIFI_TIMEOUT,
-    SHEETS_WEBHOOK_URL, SHEETS_TIMEOUT, LOG_DIR,
+    SHEETS_WEBHOOK_URL, LOG_DIR,
 )
 
 UPLOAD_TRACKER        = "/logs/uploaded.json"
@@ -165,6 +166,137 @@ def cleanup_old_uploads():
 
 
 # ============================================================
+# RAW HTTP POST (bypasses urequests — full control over request format)
+# ============================================================
+
+def _http_post_json(url, body, timeout=10):
+    """
+    Send a raw HTTPS POST with JSON body. Follows up to 5 redirects.
+    Uses ssl.SSLContext for best TLS compatibility with Google.
+    Returns (status_code, response_body_text) or raises.
+    """
+    MAX_REDIRECTS = 5
+    MAX_RESPONSE  = 8192
+
+    # Parse URL
+    if url.startswith("https://"):
+        url = url[8:]
+    host, _, path = url.partition("/")
+    path = "/" + path
+
+    # Build HTTP request — include Accept header that Google expects
+    body_bytes = body.encode("utf-8")
+    header = (
+        f"POST {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"User-Agent: MicroPython/1.24\r\n"
+        f"Accept: application/json, */*\r\n"
+        f"Content-Type: application/json\r\n"
+        f"Content-Length: {len(body_bytes)}\r\n"
+        f"Connection: close\r\n"
+        f"\r\n"
+    ).encode("utf-8")
+    request = header + body_bytes
+
+    # Use SSLContext for best TLS negotiation with Google
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.verify_mode = ssl.CERT_NONE
+
+    addr = usocket.getaddrinfo(host, 443)[0][-1]
+    sock = usocket.socket()
+    sock.settimeout(timeout)
+    status_code = 0
+    body_raw = ""
+    try:
+        sock.connect(addr)
+        sock = ctx.wrap_socket(sock, server_hostname=host)
+        sock.write(request)
+        response = b""
+        while True:
+            chunk = sock.read(512)
+            if not chunk:
+                break
+            response += chunk
+            if len(response) > MAX_RESPONSE:
+                break
+    finally:
+        sock.close()
+
+    # Split headers from body
+    header_end = response.find(b"\r\n\r\n")
+    if header_end == -1:
+        return 0, ""
+    headers_raw = response[:header_end].decode("utf-8", "ignore")
+    body_raw = response[header_end + 4:].decode("utf-8", "ignore")
+
+    # Extract status code
+    status_line = headers_raw.split("\r\n")[0]
+    try:
+        status_code = int(status_line.split(" ")[1])
+    except Exception:
+        status_code = 0
+
+    # Follow redirects (up to MAX_REDIRECTS hops)
+    for _ in range(MAX_REDIRECTS):
+        if status_code not in (301, 302, 307):
+            break
+        loc = ""
+        for line in headers_raw.split("\r\n"):
+            if line.lower().startswith("location:"):
+                loc = line.split(":", 1)[1].strip()
+                break
+        if not loc:
+            break
+        print(f"[uploader] Following redirect → {loc[:60]}...")
+        # Parse redirect URL
+        if loc.startswith("https://"):
+            loc = loc[8:]
+        host, _, path = loc.partition("/")
+        path = "/" + path
+        # 301/302: switch to GET; 307: re-POST
+        if status_code in (301, 302):
+            req = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: {host}\r\n"
+                f"User-Agent: MicroPython/1.24\r\n"
+                f"Accept: application/json, */*\r\n"
+                f"Connection: close\r\n"
+                f"\r\n"
+            ).encode("utf-8")
+        else:
+            req = header + body_bytes
+        addr = usocket.getaddrinfo(host, 443)[0][-1]
+        sock = usocket.socket()
+        sock.settimeout(timeout)
+        try:
+            sock.connect(addr)
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+            sock.write(req)
+            response = b""
+            while True:
+                chunk = sock.read(512)
+                if not chunk:
+                    break
+                response += chunk
+                if len(response) > MAX_RESPONSE:
+                    break
+        finally:
+            sock.close()
+        header_end = response.find(b"\r\n\r\n")
+        if header_end == -1:
+            return 0, ""
+        headers_raw = response[:header_end].decode("utf-8", "ignore")
+        body_raw = response[header_end + 4:].decode("utf-8", "ignore")
+        status_line = headers_raw.split("\r\n")[0]
+        try:
+            status_code = int(status_line.split(" ")[1])
+        except Exception:
+            status_code = 0
+
+    return status_code, body_raw
+
+
+# ============================================================
 # FILE UPLOADER
 # ============================================================
 
@@ -198,6 +330,7 @@ def _upload_file(filepath):
 
     # Upload in small batches to avoid ESP32 memory pressure
     BATCH_SIZE = 5
+
     for i in range(0, len(data_lines), BATCH_SIZE):
         batch = data_lines[i:i + BATCH_SIZE]
         rows  = []
@@ -213,28 +346,28 @@ def _upload_file(filepath):
 
         # Debug: print first batch JSON so we can see exactly what's being rejected
         if i == 0:
-            payload = json.dumps({"rows": rows})
-            print(f"[uploader] Debug — JSON payload ({len(payload)} bytes)")
-            # Print in chunks so nothing is truncated
-            for start in range(0, len(payload), 200):
-                print(f"[uploader]   {payload[start:start+200]}")
+            dbg = json.dumps({"rows": rows})
+            print(f"[uploader] Debug — JSON payload ({len(dbg)} bytes)")
+            for start in range(0, len(dbg), 200):
+                print(f"[uploader]   {dbg[start:start+200]}")
 
         try:
             payload = json.dumps({"rows": rows})
-            response = urequests.post(
-                SHEETS_WEBHOOK_URL,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                timeout=SHEETS_TIMEOUT,
-            )
-            if response.status_code == 200:
+            status_code, body = _http_post_json(SHEETS_WEBHOOK_URL, payload)
+
+            if status_code == 200:
                 success += len(rows)
             else:
-                print(f"[uploader] HTTP {response.status_code} "
+                print(f"[uploader] HTTP {status_code} "
                       f"on batch {i // BATCH_SIZE + 1}")
+                print(f"[uploader] Response body: {body[:300]}")
                 errors += len(rows)
-            response.close()
 
+        except OSError as e:
+            # SSL / socket-level errors often manifest as OSError on ESP32
+            print(f"[uploader] Socket/SSL error batch "
+                  f"{i // BATCH_SIZE + 1}: {e}")
+            errors += len(rows)
         except Exception as e:
             print(f"[uploader] POST error batch "
                   f"{i // BATCH_SIZE + 1}: {e}")

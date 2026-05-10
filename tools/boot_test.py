@@ -2,9 +2,17 @@
 # boot_test.py — Pre-Flight Validation Script
 # Run this on LOLIN Pro to verify everything is configured correctly
 # before attempting main.py
+# Usage: Copy to ESP32 root alongside config.py etc., then run.
+#        Or from repo: cd xc90_logger && python tools/boot_test.py
 # ============================================================
 
+import os
 import sys
+
+# Allow running from tools/ subdirectory on PC
+_p = os.path.join(os.path.dirname(__file__), '..')
+if _p not in sys.path:
+    sys.path.insert(0, _p)
 
 print("\n" + "="*50)
 print(" XC90 Logger — Pre-Flight Validation")

@@ -7,7 +7,7 @@ WIFI_PASSWORD = "House@77"
 WIFI_TIMEOUT = 10  # seconds to wait before giving up
 
 # Google Sheets
-SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbw541WzGCItgElGK2Ddu7h1Yvfw8WtQvE3FOXuck2ubxM4lVOich8G8zrSKjuyXZEGq/exec"
+SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwIYHoQsp1Y3kt4XaW0kg0tl0T3D6GMdORwxyJ-sSSWVdFjExO4zFJ407dW6dRMKWBQ/exec"
 SHEETS_TIMEOUT = 5  # seconds before giving up on upload
 
 # BLE / iCar Pro
@@ -16,6 +16,17 @@ ICAR_DEVICE_NAME_ANDROID = "ANDROID-Vlink"
 BLE_SCAN_TIMEOUT = 10      # seconds to scan before giving up
 BLE_CONNECT_TIMEOUT = 10   # seconds to wait for connection
 BLE_RETRY_LIMIT = 3        # how many times to retry on failure
+
+# OBD auto-discovery — 16-bit service UUIDs to look for in BLE advertisements
+# 0xFFF0 = standard ELM327 BLE service
+# 0xFFE0 = some clone adapters use this
+# 0x18F0 = iCar Pro variant
+OBD_SCAN_SERVICE_UUIDS = (0xFFF0, 0xFFE0, 0x18F0)
+
+# Tier 3: brute-force connect-and-probe settings
+BLE_PROBE_SCAN_TIME = 8           # seconds to scan for all nearby devices
+BLE_PROBE_PER_DEVICE_TIMEOUT = 5  # seconds per device connection attempt
+BLE_PROBE_MAX_DEVICES = 8         # max devices to probe (strongest signals first)
 
 # Known iCar Pro MAC addresses (from BLE scans)
 # If name-based discovery fails, we try connecting to these directly
@@ -35,8 +46,11 @@ ICAR_NOTIFY_CHAR_UUID= "00002af0-0000-1000-8000-00805f9b34fb"
 # Sampling intervals in milliseconds
 SAMPLE_RATE_CRITICAL = 1000   # RPM, coolant, boost — every 1 second
 SAMPLE_RATE_STANDARD = 2000   # fuel trims, MAF, throttle — every 2 seconds
-SAMPLE_RATE_SLOW     = 5000   # oil temp, battery — every 5 seconds
-SAMPLE_RATE_ENHANCED = 10000  # Volvo enhanced PIDs — every 10 seconds
+SAMPLE_RATE_SLOW     = 5000   # oil temp, battery, DTCs — every 5 seconds
+
+# Row output interval — one AI-ready dense row per second
+# SensorState forward-fills: every column has a value at every timestamp
+ROW_INTERVAL_MS = 1000  # produce 1 row per second (1Hz)
 
 # Trip detection
 TRIP_START_RPM = 100        # RPM above this = engine running

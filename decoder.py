@@ -4,6 +4,8 @@
 
 from pids import ALL_PIDS
 
+# No enhanced PIDs — all Mode 01 standard OBD-II only
+
 RESPONSE_OK          = "ok"
 RESPONSE_ERROR       = "error"
 RESPONSE_UNSUPPORTED = "unsupported"
@@ -70,9 +72,6 @@ def validate_response(cleaned, cmd):
         expected_header = "4" + cmd[1:4]
         if not cleaned.startswith(expected_header):
             return False
-    elif cmd.startswith("21") or cmd.startswith("22"):
-        if len(cleaned) < 6:
-            return False
     return True
 
 
@@ -89,12 +88,8 @@ def extract_bytes(cleaned, cmd):
         data   = "0190" → [0x01, 0x90] → [1, 144]
     """
     try:
-        if cmd.startswith("01"):
-            data_hex = cleaned[4:]
-        elif cmd.startswith("21") or cmd.startswith("22"):
-            data_hex = cleaned[6:]
-        else:
-            data_hex = cleaned[4:]
+        # All Mode 01: response header is 4 hex chars (2 bytes)
+        data_hex = cleaned[4:]
         byte_pairs = [data_hex[i:i+2] for i in range(0, len(data_hex), 2)]
         return [int(b, 16) for b in byte_pairs if len(b) == 2]
     except Exception:
@@ -169,17 +164,22 @@ def decode(pid_name, cmd, raw_response):
 def calculate_derived(current_values):
     """
     Calculate derived PIDs from already-decoded values.
-    Call this after each sampling cycle with the latest values dict.
-    
-    Returns dict of derived values to merge into the log row.
+    Call after each sampling cycle with the latest values dict.
+
+    Returns dict of derived values.
     """
     derived = {}
+
+    # Fuel trim sum: STFT + LTFT = total fuel correction
     stft = current_values.get("stft_pct")
     ltft = current_values.get("ltft_pct")
     if stft is not None and ltft is not None:
         derived["fuel_trim_sum"] = round(stft + ltft, 2)
-    actual = current_values.get("boost_actual_kpa")
-    target = current_values.get("boost_target_kpa")
-    if actual is not None and target is not None:
-        derived["boost_delta_kpa"] = round(actual - target, 1)
+
+    # IAT-ambient delta: intercooler efficiency indicator
+    iat = current_values.get("intake_air_temp_c")
+    amb = current_values.get("ambient_air_temp_c")
+    if iat is not None and amb is not None:
+        derived["iat_ambient_delta_c"] = round(iat - amb, 1)
+
     return derived

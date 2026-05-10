@@ -6,16 +6,14 @@
 import time
 import uasyncio as asyncio
 from config import (
+    ROW_INTERVAL_MS,
     SAMPLE_RATE_CRITICAL,
     SAMPLE_RATE_STANDARD,
     SAMPLE_RATE_SLOW,
-    SAMPLE_RATE_ENHANCED,
     IDLE_POLL_INTERVAL,
-    BLE_RETRY_LIMIT,
     FW_VERSION,
-    KNOWN_ICAR_PRO_MACS
 )
-from pids import PIDS_BY_TIER
+from pids import PIDS_BY_TIER, ALL_PIDS
 from obd import OBDClient
 from decoder import RESPONSE_OK
 from logger import (
@@ -34,100 +32,135 @@ from uploader import (
 class SensorState:
     """
     Holds latest decoded value for every PID.
-    Updated each time a PID is successfully queried.
-    Ensures every CSV row has all columns populated
-    even when some tiers haven't sampled yet this cycle.
+    Forward-fills: when a PID hasn't been queried this cycle,
+    its last known value is used. This ensures every CSV row
+    has all columns populated — AI-ready dense rows.
     """
 
     def __init__(self):
         self._values = {}
 
     def update(self, pid_name, decode_result):
-        """Update state if decode was successful."""
+        """Update state if decode was successful. Keeps last value on failure."""
         if decode_result and decode_result["status"] == RESPONSE_OK:
             self._values[pid_name] = decode_result["value"]
 
     def get_all(self):
-        """Return copy of all current values."""
+        """Return copy of all current values (forward-filled)."""
         return dict(self._values)
 
     def get(self, pid_name):
         return self._values.get(pid_name)
-    
-async def sampler_task(obd, trip_manager, log_buffer, sensor_state, tier):
-    """
-    Async task for a single sampling tier.
-    Runs independently for each tier — critical, standard, slow, enhanced.
 
-    Each tier loops forever at its own interval,
-    querying its PIDs and adding rows to the buffer.
-    """
-    pids      = PIDS_BY_TIER[tier]
-    interval  = {
-        "critical": SAMPLE_RATE_CRITICAL,
-        "standard": SAMPLE_RATE_STANDARD,
-        "slow":     SAMPLE_RATE_SLOW,
-        "enhanced": SAMPLE_RATE_ENHANCED,
-    }[tier] / 1000  # convert ms to seconds
 
-    print(f"[sampler:{tier}] Started — interval {interval}s")
+async def sampler_sequential(obd, trip_manager, log_buffer, sensor_state):
+    """
+    Single sequential sampler — Torque Pro method.
+    One loop queries all PIDs in sequence at ROW_INTERVAL_MS.
+
+    Each cycle:
+      1. Query critical PIDs (every cycle)
+      2. Query standard PIDs (every 2nd cycle)
+      3. Query slow PIDs (every 5th cycle)
+      4. Build ONE dense row with all forward-filled values
+
+    No concurrent queries, no mode switching, no collisions.
+    SensorState forward-fills: every column populated every row.
+    """
+    row_interval = ROW_INTERVAL_MS / 1000  # seconds
+    cycle = 0
+
+    critical_pids = PIDS_BY_TIER["critical"]
+    standard_pids = PIDS_BY_TIER["standard"]
+    slow_pids     = PIDS_BY_TIER["slow"]
+
+    print("[sampler] Sequential sampler started — 1 row/%.0fs" % row_interval)
+    print("[sampler] Critical: %d PIDs every cycle" % len(critical_pids))
+    print("[sampler] Standard: %d PIDs every 2nd cycle" % len(standard_pids))
+    print("[sampler] Slow:     %d PIDs every 5th cycle" % len(slow_pids))
 
     while True:
-        # Only sample when trip is active
-        # Exception: always sample critical for trip detection
-        if not trip_manager.trip_active and tier != "critical":
+        cycle_start = time.time()
+        cycle += 1
+
+        # Idle mode: when engine is off, poll slowly
+        if not trip_manager.trip_active:
+            # Still query critical PIDs to detect trip start
+            rpm_cmd = critical_pids.get("rpm", {}).get("cmd")
+            if rpm_cmd:
+                result = obd.query("rpm")
+                if result:
+                    sensor_state.update("rpm", result)
+
+            # Run trip detection
+            rpm = sensor_state.get("rpm")
+            speed = sensor_state.get("vehicle_speed_kph")
+            trip_manager.update(rpm, speed)
+
             await asyncio.sleep(IDLE_POLL_INTERVAL / 1000)
             continue
 
-        if not obd.is_connected():
-            await asyncio.sleep(1)
-            continue
-
-        for pid_name, pid_def in pids.items():
-            # Skip derived PIDs — calculated not queried
+        # --- Query critical PIDs (every cycle) ---
+        for pid_name, pid_def in critical_pids.items():
             if pid_def["cmd"] is None:
                 continue
-
+            if not obd.is_connected():
+                break
             result = obd.query(pid_name)
-
             if result:
-                # Update shared sensor state
                 sensor_state.update(pid_name, result)
 
-                # Build and buffer row
-                row = build_row(
-                    trip_manager    = trip_manager,
-                    decoded_values  = sensor_state.get_all(),
-                    sample_tier     = tier,
-                    raw_pid         = pid_def["cmd"],
-                    raw_response    = result["raw"],
-                    decode_status   = result["status"],
-                )
-                log_buffer.add(row)
+        # --- Query standard PIDs (every 2nd cycle) ---
+        if cycle % 2 == 0 and obd.is_connected():
+            for pid_name, pid_def in standard_pids.items():
+                if pid_def["cmd"] is None:
+                    continue
+                if not obd.is_connected():
+                    break
+                result = obd.query(pid_name)
+                if result:
+                    sensor_state.update(pid_name, result)
 
-        await asyncio.sleep(interval)
+        # --- Query slow PIDs (every 5th cycle) ---
+        if cycle % 5 == 0 and obd.is_connected():
+            for pid_name, pid_def in slow_pids.items():
+                if pid_def["cmd"] is None:
+                    continue
+                if not obd.is_connected():
+                    break
+                result = obd.query(pid_name)
+                if result:
+                    sensor_state.update(pid_name, result)
 
-async def trip_monitor_task(trip_manager, sensor_state, log_buffer):
-    """
-    Monitors RPM and speed to manage trip start/end.
-    Runs every second regardless of other samplers.
-    Also triggers buffer flush on trip end.
-    """
-    print("[trip] Monitor started")
-
-    while True:
-        rpm   = sensor_state.get("rpm")
+        # --- Run trip detection ---
+        rpm = sensor_state.get("rpm")
         speed = sensor_state.get("vehicle_speed_kph")
-
         was_active = trip_manager.trip_active
         trip_manager.update(rpm, speed)
 
-        # Trip just ended — flush buffer immediately
+        # Trip just ended — flush buffer
         if was_active and not trip_manager.trip_active:
             print("[trip] Flushing buffer on trip end")
             log_buffer.flush()
 
-        await asyncio.sleep(1)
+        # --- Build one dense row with all forward-filled values ---
+        if trip_manager.trip_active:
+            row = build_row(
+                trip_manager   = trip_manager,
+                decoded_values = sensor_state.get_all(),
+                sample_tier    = "sequential",
+                raw_pid        = "ALL",
+                raw_response   = "",
+                decode_status  = "ok",
+            )
+            log_buffer.add(row)
+
+        # --- Maintain steady pace ---
+        elapsed = time.time() - cycle_start
+        sleep_time = max(0, row_interval - elapsed)
+        if sleep_time < row_interval * 0.5:
+            print("[sampler] ⚠ Cycle %d took %.2fs (over half interval)" % (cycle, elapsed))
+        await asyncio.sleep(sleep_time)
 
 async def upload_task(wifi_manager, log_buffer):
     """
@@ -175,7 +208,10 @@ async def connection_task(obd, sensor_state):
 
 async def boot():
     """
-    Full boot sequence.
+    Full boot sequence — upload and BLE run in parallel.
+    Upload fires immediately so data reaches Google Sheets
+    the moment you bring the ESP32 home.
+    BLE retries forever until the iCar Pro is in range.
     Returns (obd, trip_manager, log_buffer, 
              sensor_state, wifi_manager)
     or raises on unrecoverable failure.
@@ -198,33 +234,53 @@ async def boot():
     sensor_state = SensorState()
     wifi_manager = WiFiManager()
 
-    # 3. Connect to iCar Pro with retry
-    print("[boot] Connecting to iCar Pro...")
-    connected = False
-    for attempt in range(1, BLE_RETRY_LIMIT + 1):
-        print(f"[boot] Attempt {attempt}/{BLE_RETRY_LIMIT}")
-        if obd.connect():
-            connected = True
-            break
-        await asyncio.sleep(3)
+    # 3. Launch upload and BLE connection in parallel
+    upload_done   = asyncio.Event()
+    ble_connected = asyncio.Event()
 
-    if not connected:
-        print("[boot] ⚠ Could not connect to iCar Pro")
-        print("[boot] Will retry in connection monitor")
+    async def _boot_upload():
+        """Background: upload any pending CSV files via WiFi."""
+        print("[boot:upload] Starting background upload...")
+        try:
+            uploaded = upload_pending(wifi_manager, log_buffer.log_file)
+            if uploaded > 0:
+                print(f"[boot:upload] Uploaded {uploaded} rows")
+            else:
+                print("[boot:upload] Nothing to upload (or WiFi unavailable)")
+        except Exception as e:
+            print(f"[boot:upload] Error: {e}")
+        finally:
+            upload_done.set()
 
-    # 4. Run PID probe on first boot
-    if connected and obd.probe_needed():
-        print("[boot] First boot — running PID probe")
-        print("[boot] Engine must be running for probe")
-        await asyncio.sleep(2)  # brief pause before probe
-        results = obd.run_pid_probe()
-        supported = sum(1 for v in results.values() if v == "ok")
-        print(f"[boot] Probe complete: "
-              f"{supported}/{len(results)} PIDs supported")
+    async def _boot_ble():
+        """Background: keep trying BLE until connected."""
+        print("[boot:ble] Starting BLE connection loop...")
+        attempt = 0
+        while True:
+            attempt += 1
+            print(f"[boot:ble] Attempt {attempt}...")
+            try:
+                if obd.connect():
+                    ble_connected.set()
+                    print(f"[boot:ble] Connected on attempt {attempt}")
+                    return
+            except Exception as e:
+                print(f"[boot:ble] Error on attempt {attempt}: {e}")
+            print(f"[boot:ble] Failed — retrying in 3s...")
+            await asyncio.sleep(3)
 
-    # 5. Attempt initial WiFi upload of any pending files
-    print("[boot] Checking for pending uploads...")
-    upload_pending(wifi_manager, log_buffer.log_file)
+    asyncio.create_task(_boot_upload())
+    asyncio.create_task(_boot_ble())
+
+    # 4. Wait for BLE to connect (never-ending retries; upload runs in background)
+    print("[boot] Waiting for BLE (upload runs in background)...")
+    await ble_connected.wait()
+
+    # 5. Ensure upload finished before PID probe (WiFi vs BLE radio safety)
+    await upload_done.wait()
+
+    # No PID probe needed — all Mode 01 standard PIDs only
+    # Enhanced PIDs removed (always returned NO DATA on SPA platform)
 
     print("[boot] Boot complete\n")
     return obd, trip_manager, log_buffer, sensor_state, wifi_manager
@@ -242,26 +298,11 @@ async def main():
         return
 
     # Launch all concurrent tasks
+    # Single sequential sampler replaces the 4 old tier-specific samplers
+    # Trip monitor removed — sampler_sequential handles trip state inline
     tasks = [
         asyncio.create_task(
-            sampler_task(obd, trip_manager, log_buffer,
-                        sensor_state, "critical")
-        ),
-        asyncio.create_task(
-            sampler_task(obd, trip_manager, log_buffer,
-                        sensor_state, "standard")
-        ),
-        asyncio.create_task(
-            sampler_task(obd, trip_manager, log_buffer,
-                        sensor_state, "slow")
-        ),
-        asyncio.create_task(
-            sampler_task(obd, trip_manager, log_buffer,
-                        sensor_state, "enhanced")
-        ),
-        asyncio.create_task(
-            trip_monitor_task(trip_manager, sensor_state,
-                             log_buffer)
+            sampler_sequential(obd, trip_manager, log_buffer, sensor_state)
         ),
         asyncio.create_task(
             upload_task(wifi_manager, log_buffer)

@@ -2,9 +2,10 @@
 __pycache__/
 *.pyc
 *.pyo
+.pytest_cache/
 
 # ESP32 runtime files (generated on device)
-/logs/
+logs/
 pid_probe.json
 uploaded.json
 
@@ -25,5 +26,9 @@ Thumbs.db
 desktop.ini
 
 # Wokwi
-wokwi-bin/
+hw/wokwi-bin/
 *.bin
+
+# Data (sample CSVs are versioned, runtime logs are not)
+data/*.csv
+!data/xc90_001.csv

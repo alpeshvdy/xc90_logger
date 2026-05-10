@@ -64,7 +64,7 @@ def _get_log_filename():
         except OSError:
             return path  # file doesn't exist yet, use this one
         
-# Full schema — every column in order
+# Full schema — every column in order (AI-ready: one row per second, all columns filled)
 CSV_COLUMNS = [
     "timestamp_utc",
     "timestamp_local",
@@ -73,29 +73,34 @@ CSV_COLUMNS = [
     "session_odometer",
     "engine_state",
     "drive_phase",
-    # Critical PIDs
+    # Critical PIDs (1s)
     "rpm",
     "coolant_temp_c",
     "boost_actual_kpa",
     "vehicle_speed_kph",
-    # Standard PIDs
+    # Standard PIDs (2s)
     "engine_load_pct",
     "throttle_pos_pct",
     "stft_pct",
     "ltft_pct",
     "maf_g_s",
     "intake_air_temp_c",
-    # Slow PIDs
+    "timing_advance_deg",
+    "fuel_system_status",
+    "o2_lambda",
+    "absolute_load_pct",
+    # Slow PIDs (5s) — includes derived
     "oil_temp_c",
     "battery_voltage_v",
     "baro_pressure_kpa",
+    "fuel_pressure_kpa",
+    "ambient_air_temp_c",
+    "engine_run_time_s",
+    "dtc_count",
+    "fuel_rate_l_h",
     "fuel_trim_sum",
-    # Enhanced PIDs
-    "boost_target_kpa",
-    "boost_delta_kpa",
-    "turbo_inlet_pres",
-    "oil_pressure_kpa",
-    # Raw + metadata
+    "iat_ambient_delta_c",
+    # Metadata
     "raw_pid",
     "raw_response",
     "decode_status",
@@ -243,12 +248,23 @@ class TripManager:
         self.trip_sequence += 1
         return self.trip_sequence
     
+def _sanitize(val):
+    """Strip \\r\\n from values to prevent CSV row corruption."""
+    if val is None:
+        return ""
+    s = str(val)
+    return s.replace("\r", " ").replace("\n", " ")
+
+
 def build_row(trip_manager, decoded_values, sample_tier, raw_pid, raw_response, decode_status):
     """
     Assemble a complete CSV row from all current values.
-    
+
+    AI-ready design: every column has a value (forward-filled by SensorState).
+    No sparse rows — one dense row per cycle.
+
     decoded_values: dict of pid_name → decoded value
-                    from the current sampling cycle
+                    from the current SensorState snapshot
     """
     now = time.time()
 
@@ -256,13 +272,13 @@ def build_row(trip_manager, decoded_values, sample_tier, raw_pid, raw_response, 
     t_utc   = _format_timestamp(time.localtime(now))
     t_local = _format_timestamp(time.localtime(int(now + UTC_OFFSET_HOURS * 3600)))
 
-    # Get key values for derived columns
+    # Key values for derived columns
     rpm      = decoded_values.get("rpm")
     speed    = decoded_values.get("vehicle_speed_kph")
     coolant  = decoded_values.get("coolant_temp_c")
     throttle = decoded_values.get("throttle_pos_pct")
 
-    # Calculate derived PIDs
+    # Calculate derived PIDs from current values
     derived = calculate_derived(decoded_values)
     all_values = {}
     all_values.update(decoded_values)
@@ -272,39 +288,46 @@ def build_row(trip_manager, decoded_values, sample_tier, raw_pid, raw_response, 
     engine_state = classify_engine_state(coolant)
     drive_phase  = classify_drive_phase(rpm, throttle, speed)
 
-    # Build row dict
+    # Build row dict — every column gets a value (empty string if missing)
     row = {
         "timestamp_utc":      t_utc,
         "timestamp_local":    t_local,
-        "trip_id":            trip_manager.trip_id or "no_trip",
+        "trip_id":            _sanitize(trip_manager.trip_id or "no_trip"),
         "trip_sequence":      trip_manager.next_sequence(),
         "session_odometer":   round(trip_manager.session_odom, 3),
         "engine_state":       engine_state,
         "drive_phase":        drive_phase,
-        # PID values — None becomes empty string in CSV
+        # Critical PIDs
         "rpm":                all_values.get("rpm", ""),
         "coolant_temp_c":     all_values.get("coolant_temp_c", ""),
         "boost_actual_kpa":   all_values.get("boost_actual_kpa", ""),
         "vehicle_speed_kph":  all_values.get("vehicle_speed_kph", ""),
+        # Standard PIDs
         "engine_load_pct":    all_values.get("engine_load_pct", ""),
         "throttle_pos_pct":   all_values.get("throttle_pos_pct", ""),
         "stft_pct":           all_values.get("stft_pct", ""),
         "ltft_pct":           all_values.get("ltft_pct", ""),
         "maf_g_s":            all_values.get("maf_g_s", ""),
         "intake_air_temp_c":  all_values.get("intake_air_temp_c", ""),
+        "timing_advance_deg": all_values.get("timing_advance_deg", ""),
+        "fuel_system_status": all_values.get("fuel_system_status", ""),
+        "o2_lambda":          all_values.get("o2_lambda", ""),
+        "absolute_load_pct":  all_values.get("absolute_load_pct", ""),
+        # Slow PIDs
         "oil_temp_c":         all_values.get("oil_temp_c", ""),
         "battery_voltage_v":  all_values.get("battery_voltage_v", ""),
         "baro_pressure_kpa":  all_values.get("baro_pressure_kpa", ""),
+        "fuel_pressure_kpa":  all_values.get("fuel_pressure_kpa", ""),
+        "ambient_air_temp_c": all_values.get("ambient_air_temp_c", ""),
+        "engine_run_time_s":  all_values.get("engine_run_time_s", ""),
+        "dtc_count":          all_values.get("dtc_count", ""),
+        "fuel_rate_l_h":      all_values.get("fuel_rate_l_h", ""),
         "fuel_trim_sum":      all_values.get("fuel_trim_sum", ""),
-        "boost_target_kpa":   all_values.get("boost_target_kpa", ""),
-        "boost_delta_kpa":    all_values.get("boost_delta_kpa", ""),
-        "turbo_inlet_pres":   all_values.get("turbo_inlet_pres", ""),
-        "oil_pressure_kpa":   all_values.get("oil_pressure_kpa", ""),
-        # Raw + metadata
-        "raw_pid":            raw_pid,
-        # Sanitize raw_response: replace \r/\n with space so CSV rows stay on single lines
-        "raw_response":       (raw_response or "").replace("\r", " ").replace("\n", " "),
-        "decode_status":      decode_status,
+        "iat_ambient_delta_c": all_values.get("iat_ambient_delta_c", ""),
+        # Metadata
+        "raw_pid":            _sanitize(raw_pid),
+        "raw_response":       _sanitize(raw_response),
+        "decode_status":      _sanitize(decode_status),
         "sample_tier":        sample_tier,
         "fw_version":         FW_VERSION,
         "vin_partial":        VIN_PARTIAL,
