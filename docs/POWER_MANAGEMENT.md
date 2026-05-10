@@ -18,6 +18,155 @@ The ESP32 draws ~80mA while active (sampling) and ~55mA while idle (BLE connecte
 | **Active idle** | ~55 mA | Engine off, polling critical PIDs every 5s, building pre-start rows |
 | **Deep sleep + timer** | ~8 μA + 15.3 mAh burst/day | RTC timer wakes every 5 min, 2.7s BLE scan each |
 | **Deep sleep + reed** | ~41 μA | Reed switch + pull-up resistor, no timer |
+| **Hard off (TJA1145)** | **~0 μA (ESP32)** | TJA1145 INH cuts power; ESP32 truly off, not sleeping |
+
+---
+
+## Recommended: TJA1145 CAN Transceiver Wake (Best Reliability + Lowest Power)
+
+### How It Works
+
+The **NXP TJA1145** is an automotive CAN FD transceiver with a built-in wake-up feature. Its `INH` (Inhibit) pin controls power to the ESP32 via the buck converter's ENABLE pin. When the car is parked and CAN bus is silent, the TJA1145 floats `INH` → buck converter disabled → **ESP32 has zero power**. When any CAN activity occurs (door unlock, key proximity, engine start), the TJA1145 drives `INH` HIGH → buck enables → **ESP32 boots from hard power-off**.
+
+**This is not deep sleep — the ESP32 is truly off.** No RTC, no wake configuration, nothing. The TJA1145 draws only ~5µA while monitoring the CAN bus.
+
+```
+CAR PARKED (CAN silent):
+  OBD CAN bus → TJA1145 monitors (5µA standby)
+                    │
+                    INH = Hi-Z (floating)
+                    │
+              Buck Converter EN = LOW (disabled)
+                    │
+              ESP32: ZERO power (truly off)
+
+CAR WAKES (CAN activity):
+  OBD CAN bus → TJA1145 detects CAN frame
+                    │
+                    INH = HIGH (drives high)
+                    │
+              Buck Converter EN = HIGH (enabled)
+                    │
+              ESP32: POWERS ON (cold boot)
+```
+
+### Circuit Diagram
+
+```
+                    ┌─────────────────────────────────────────────────────────┐
+                    │                    OBD-II PORT                         │
+  OBD Pin 16 ──────►│  16: 12V always-on  ●                                │
+  OBD Pin 4  ──────►│   4: GND           ●                                │
+  OBD Pin 6  ──────►│   6: CAN_H         ●                                │
+  OBD Pin 14 ──────►│  14: CAN_L         ●                                │
+                    └───────────┬─────────┬──────────┬──────────────────────┘
+                                │         │          │
+                         Power   │         │     CAN Bus
+                                │         │          │
+                    ┌───────────▼──┐  ┌────▼────┐ ┌───▼───────────────────┐
+                    │ Buck         │  │        │ │ TJA1145TK/3           │
+                    │ Converter    │  │ iCar   │ │ CAN FD Transceiver    │
+                    │ 12V → 5V     │  │ Pro    │ │                       │
+                    │              │  │ (BLE)  │ │ CANH ←───────── OBD-6 │
+                    │ EN ◄──┐      │  │        │ │ CANL ←───────── OBD-14│
+                    │      │      │  │        │ │ TXD  ───────── ESP32  │
+                    │ 5V ──┼──►ESP│  │        │ │ RXD  ←──────── ESP32  │
+                    │      │      │  │        │ │ INH  ──► Buck EN      │
+                    └──────┼──────┘  └─────────┘ │ STBY  ◄── GPIO (high)  │
+                           │                     │ INT   ◄── GPIO (opt.)   │
+                           │                     └────────────────────────┘
+                    12V from pin 16 ─────────────┘
+
+                    ┌───────────────────────────────────────────────────────┐
+                    │  TJA1145 INH → Buck Converter ENABLE circuit:        │
+                    │                                                       │
+                    │  TJA1145 INH pin ──[internal MOSFET]──→ Buck EN      │
+                    │         │                                        │     │
+                    │         │  (Hi-Z when sleeping, HIGH when active) │     │
+                    │         │                                        │     │
+                    │         └────────────── [10kΩ pull-down] ── GND  │     │
+                    │                                                       │
+                    │  When TJA1145 sleeps: INH = Hi-Z → EN pulled LOW  │     │
+                    │  When CAN wakes TJA1145:  INH = HIGH → EN = HIGH  │     │
+                    └───────────────────────────────────────────────────────┘
+
+                    ┌───────────────────────────────────────────────────────┐
+                    │  ESP32-S3 Pin Assignments (for TJA1145 mode):        │
+                    │                                                       │
+                    │  GPIO4  → TJA1145 INH pin (output, drives low=off)  │
+                    │  GPIO5  → TJA1145 INT pin (input, optional)          │
+                    │  GPIO6  → TJA1145 STBY pin (output, high=active)    │
+                    │  GPIO1  → TJA1145 TXD (TWAI TX)                      │
+                    │  GPIO2  → TJA1145 RXD (TWAI RX)                      │
+                    └───────────────────────────────────────────────────────┘
+```
+
+### Parts List
+
+| Part | Cost | Notes |
+|------|------|-------|
+| TJA1145TK/3 | $2–3 | HVSON-14, 3.3V VIO, automotive grade |
+| Mini360 buck converter (12V→5V, 2A) | $1 | Must have EN pin exposed |
+| 10kΩ resistor (pull-down on EN) | $0.01 | Prevents accidental enable on startup |
+| 100nF capacitor (CAN_H stability) | $0.05 | Optional, helps with CAN noise |
+| OBD-II Y-splitter cable | $8 | 1 male → 2 female |
+| USB-A to USB-C cable (old charger) | $0 | Cut for ESP32 power |
+| 1A inline fuse + holder | $1 | On 12V input to buck |
+| **Total** | **~$13** | |
+
+### TJA1145 Pin Connections
+
+| TJA1145 Pin | Function | Connect To |
+|-------------|----------|------------|
+| CANH | CAN high | OBD pin 6 (via ~100nF cap to GND optional) |
+| CANL | CAN low | OBD pin 14 |
+| TXD | CAN transmit | ESP32 GPIO1 (TWAI TX) |
+| RXD | CAN receive | ESP32 GPIO2 (TWAI RX) |
+| INH | Inhibit (power control) | Buck converter ENABLE pin |
+| STBY | Standby control | ESP32 GPIO6 (drive HIGH for normal mode) |
+| VCC | 5V power | Buck converter 5V output |
+| VIO | 3.3V I/O | ESP32 3.3V |
+| GND | Ground | OBD pin 4/5 (chassis GND) |
+| SPLIT | Bus stabilization | Leave floating or 10kΩ to GND |
+| INT | Interrupt output | ESP32 GPIO5 (optional, for diagnostics) |
+
+### Power Architecture Comparison
+
+| Mode | ESP32 State | ESP32 Parked Drain | Car Battery Impact |
+|------|------------|-------------------|-------------------|
+| **Always-on** | Active + BLE | ~1,358 mAh/day | Kills battery in ~28 days |
+| **Timer wake** | Deep sleep + periodic wake | ~15.5 mAh/day | ~258 days |
+| **Reed switch** | Deep sleep + GPIO wake | ~0.98 mAh/day | ~289 days |
+| **TJA1145** | **Hard off (truly off)** | **~0 mAh (ESP32)** | **~289 days + TJA1145 standby ~5µA** |
+
+### Key Advantages of TJA1145
+
+1. **Zero ESP32 power when parked** — truly hard off, not sleeping
+2. **Instant detection** — catches any CAN activity the moment it happens (door unlock, key proximity, engine start)
+3. **No door wiring needed** — CAN bus captures all wake events automatically
+4. **Works alongside iCar Pro** — both connected to same CAN bus, no interference
+5. **ESP32 boots cleanly** — every boot is a cold boot, no RTC magic state corruption
+6. **Simplified code** — no wake cause detection, no ext0 GPIO configuration, no RTC memory reads
+
+### Boot Flow with TJA1145
+
+```
+TJA1145 INH = HIGH (power restored by CAN activity)
+      │
+      ▼
+ESP32 boots COLD (power-on reset)
+      │
+      ▼
+tja1145_init() — configure INH/STBY pins
+detect_boot_cause() → "tja1145"
+      │
+      ▼
+Full boot (always — any CAN wake is a real event)
+      │
+BLE connect → Sample → Upload
+      │
+30 min idle → tja1145_power_off() → ESP32 goes truly off
+```
 
 ---
 
@@ -25,16 +174,18 @@ The ESP32 draws ~80mA while active (sampling) and ~55mA while idle (BLE connecte
 
 ### Comparison
 
-| | Timer Wake | Reed Switch (GPIO) | Both |
-|---|---|---|---|
-| **Wake mechanism** | RTC alarm every 5 min | GPIO ext0 on door open | GPIO primary + timer fallback |
-| **ESP32 parked draw** | ~15.5 mAh/day | **~0.98 mAh/day** | ~1.0 mAh/day |
-| **Wasted wake cycles** | 98.6% (284/288 find iCar asleep) | **0%** | <1% |
-| **Data missed on start** | Up to 5 min | **0 sec** | **0 sec** (GPIO wins) |
-| **Wake latency** | 0–300 seconds | **<50 ms** | **<50 ms** |
-| **Hardware needed** | None | $1 reed switch + magnet | $1 reed switch + magnet |
-| **Install difficulty** | None (code only) | Tape magnet to door | Tape magnet to door |
-| **Car battery lasts¹** | ~258 days | **~289 days** | ~285 days |
+| | TJA1145 (CAN) | Timer Wake | Reed Switch (GPIO) | Both |
+|---|---|---|---|---|
+| **Wake mechanism** | CAN transceiver INH pin | RTC alarm every 5 min | GPIO ext0 on door open | GPIO primary + timer fallback |
+| **ESP32 state when parked** | **Hard off (zero power)** | Deep sleep (~8µA) | Deep sleep (~41µA) | Deep sleep (~41µA) |
+| **ESP32 parked drain** | **~0 mAh/day** | ~15.5 mAh/day | ~0.98 mAh/day | ~1.0 mAh/day |
+| **Wake latency** | **Instant (CAN detection)** | 0–300 sec | <50 ms | <50 ms |
+| **Wasted cycles** | **0%** | 98.6% | 0% | <1% |
+| **Data missed on start** | **0 sec** | Up to 5 min | 0 sec | 0 sec |
+| **Hardware needed** | TJA1145 + wiring to CAN | None | $1 reed + magnet | $1 reed + magnet |
+| **Install difficulty** | Wire to OBD CAN pins | None (code only) | Tape to door | Tape to door |
+| **Code complexity** | Low (all cold boots) | Medium (wake detection) | Medium (ext0 + RTC) | Medium |
+| **Car battery lasts¹** | **~289+ days** | ~258 days | ~289 days | ~285 days |
 
 ¹ 70Ah AGM battery, 50% usable (35Ah), driving surplus ignored
 
@@ -93,33 +244,37 @@ Deep Sleep (41 μA)
 All settings in `config.py`:
 
 ```python
-# Wake mode: "timer", "reed", "both", or "none"
-WAKE_MODE = "timer"
+# Wake mode: "tja1145", "timer", "reed", or "none"
+WAKE_MODE = "tja1145"  # Recommended: TJA1145 INH-based hard-off
 
-# Engine must be off this long before sleep
+# Engine must be off this long before sleep/power-off
 SLEEP_AFTER_IDLE_MS = 30 * 60 * 1000  # 30 minutes
 
-# Timer interval (only used in "timer" and "both" modes)
-SLEEP_WAKE_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes
+# --- TJA1145 CAN Transceiver (WAKE_MODE = "tja1145") ---
+# Pins for TJA1145 power control and TWAI CAN bus
+TJA1145_INH_GPIO  = 4   # INH pin → Buck EN (output, drives LOW to cut power)
+TJA1145_INT_GPIO  = 5   # INT pin (optional diagnostics)
+TJA1145_STBY_GPIO = 6   # STBY pin (output, drive HIGH for normal mode)
+TWAI_TX_GPIO = 1        # ESP32 TWAI transmit → TJA1145 TXD
+TWAI_RX_GPIO = 2        # ESP32 TWAI receive  → TJA1145 RXD
 
-# BLE scan timeout on timer wake
-WAKE_BLE_SCAN_TIMEOUT = 3  # seconds
+# --- Timer Wake (WAKE_MODE = "timer") ---
+SLEEP_WAKE_INTERVAL_MS = 5 * 60 * 1000  # 5 minutes between wake attempts
+WAKE_BLE_SCAN_TIMEOUT  = 3              # seconds to BLE scan for iCar Pro
 
-# Reed switch GPIO pin (RTC-capable, must be 0-21)
-REED_GPIO_PIN = 4
-
-# Wake level: 1 = HIGH (door open, switch opens, pull-up pulls high)
-REED_WAKE_LEVEL = 1
+# --- Reed Switch (WAKE_MODE = "reed") ---
+REED_GPIO_PIN    = 4   # RTC-capable GPIO
+REED_WAKE_LEVEL  = 1   # 1 = wake on HIGH (door open)
 ```
 
 ### Changing Modes
 
 | From → To | What to change | Hardware |
 |-----------|---------------|----------|
-| `timer` → `reed` | Set `WAKE_MODE = "reed"`, wire reed switch | Add $1 reed + magnet |
-| `timer` → `both` | Set `WAKE_MODE = "both"`, wire reed switch | Add $1 reed + magnet |
-| `timer` → `none` | Set `WAKE_MODE = "none"` | None (not recommended) |
-| `reed` → `timer` | Set `WAKE_MODE = "timer"` | Remove reed switch |
+| `tja1145` → `timer` | Set `WAKE_MODE = "timer"`, remove TJA1145 | None |
+| `tja1145` → `reed` | Set `WAKE_MODE = "reed"`, wire reed switch | Add $1 reed + magnet |
+| `timer` → `tja1145` | Set `WAKE_MODE = "tja1145"`, wire TJA1145 | Add TJA1145 + wiring |
+| `reed` → `tja1145` | Set `WAKE_MODE = "tja1145"`, wire TJA1145 | Add TJA1145 + wiring |
 
 No code changes needed — just update `WAKE_MODE` in `config.py`.
 
@@ -269,15 +424,17 @@ The boot cause is stored in RTC memory (survives deep sleep). On wake, `detect_b
 
 | Your Situation | Recommended `WAKE_MODE` |
 |----------------|------------------------|
+| I want maximum reliability + lowest power | `"tja1145"` |
 | I want to test now, no hardware | `"timer"` |
 | I have a reed switch wired up | `"reed"` |
-| I want the best of both | `"both"` |
 | My car is on a battery tender | `"none"` (always-on) |
-| I park for weeks at a time | `"reed"` + unplug iCar Pro |
-
----
+| I park for weeks at a time | `"tja1145"` (zero ESP32 drain) |
 
 ## Appendix: OBD Power Wiring — ESP32 + iCar Pro from One Port
+
+> **Note:** The TJA1145 approach uses the SAME OBD port connections as the iCar Pro Y-splitter. The CAN_H/CAN_L lines are a shared bus — both the iCar Pro and the TJA1145 listen to the same CAN traffic. The TJA1145 monitors CAN for wake events; the iCar Pro uses CAN for OBD-II communication. They coexist without interference.
+
+
 
 The OBD-II port provides constant 12V on pin 16 (unswitched) and ground on pins 4/5. Both devices can be powered from the same port using a Y-splitter.
 

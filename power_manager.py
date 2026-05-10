@@ -1,13 +1,22 @@
 # ============================================================
-# power_manager.py — Deep Sleep & Wake Management
+# power_manager.py -- Deep Sleep & Wake Management
 #
-# Handles deep sleep entry and wake-up strategies for the
-# XC90 OBD Logger. Supports three wake modes:
+# WAKE_MODE = 'tja1145':
+#   TJA1145 CAN transceiver INH pin controls ESP32 power.
+#   When CAN is silent → INH floats → buck disabled → ESP32 HARD OFF.
+#   Any CAN activity → TJA1145 drives INH HIGH → buck enabled → ESP32 boots.
+#   ~5µA standby, ESP32 zero power when parked.
 #
-#   "timer"  — RTC timer wake, quick BLE scan, sleep if car off
-#   "reed"   — GPIO ext0 wake from reed switch (door open)
-#   "both"   — Reed switch primary + timer fallback
-#   "none"   — Never sleep (always-on)
+# WAKE_MODE = 'timer':
+#   RTC timer wakes every SLEEP_WAKE_INTERVAL_MS.
+#   Quick 3s BLE scan for iCar Pro → full boot if found, back to sleep if not.
+#
+# WAKE_MODE = 'reed':
+#   GPIO ext0 wake from reed switch on door.
+#   ESP32 sleeps forever until door opens.
+#
+# WAKE_MODE = 'none':
+#   Never sleep (always-on, ~1355 mAh/day).
 #
 # ============================================================
 
@@ -15,223 +24,196 @@ import machine
 import esp32
 from config import (
     WAKE_MODE,
-    REED_GPIO_PIN,
-    REED_WAKE_LEVEL,
+    TJA1145_INH_GPIO,
+    TJA1145_STBY_GPIO,
+    TJA1145_INT_GPIO,
+    SLEEP_AFTER_IDLE_MS,
     SLEEP_WAKE_INTERVAL_MS,
-    WAKE_BLE_SCAN_TIMEOUT,
 )
 
-# RTC memory layout:
-#   [0:4]   Magic bytes identifying last sleep type
-#   [4:8]   Sleep counter for diagnostics
-_RTC_MAGIC_TIMER = b"XC91"
-_RTC_MAGIC_GPIO  = b"XC92"
-_RTC_MAGIC_BOTH  = b"XC93"
-_RTC_MAGIC_COLD  = b"XC90"
+# RTC magic bytes for non-TJA1145 wake cause detection
+_RTC_MAGIC_TIMER = b'XC91'
+_RTC_MAGIC_GPIO   = b'XC92'
+_RTC_MAGIC_BOTH   = b'XC93'
 
 
-# ============================================================
-# Boot Cause Detection
-# ============================================================
+# =============================================================================
+# Public helpers — import these directly from power_manager
+# =============================================================================
 
 def detect_boot_cause():
-    """
-    Determine why the ESP32 just booted.
-    Uses a combination of reset_cause() and RTC memory
-    to distinguish between cold boot, timer wake, and GPIO wake.
-
-    Returns one of: 'cold', 'timer', 'gpio', 'both'
-    """
-    cause = machine.reset_cause()
-
-    if cause == machine.PWRON_RESET:
-        return "cold"
-
-    if cause == machine.DEEPSLEEP_RESET:
-        # Deep sleep wake — check RTC memory for discriminator
-        try:
-            rtc = machine.RTC()
-            mem = rtc.memory()
-            if mem[:4] == _RTC_MAGIC_GPIO:
-                return "gpio"
-            elif mem[:4] == _RTC_MAGIC_BOTH:
-                return "both"
-            elif mem[:4] == _RTC_MAGIC_TIMER:
-                return "timer"
-            else:
-                return "cold"  # unknown RTC state, treat as cold
-        except Exception:
-            return "cold"
-
-    # HARD_RESET, WDT_RESET, SOFT_RESET — treat as cold
-    return "cold"
+    pm = PowerManager()
+    return pm._detect()
 
 
-def _write_rtc_magic(magic):
-    """Write magic bytes + counter to RTC memory before sleep."""
-    try:
-        rtc = machine.RTC()
-        # Preserve counter if present, otherwise start at 0
-        old = rtc.memory()
-        counter = 0
-        if len(old) >= 8:
-            try:
-                counter = int.from_bytes(old[4:8], "little") + 1
-            except Exception:
-                counter = 0
-        rtc.memory(magic + counter.to_bytes(4, "little"))
-    except Exception:
-        pass
+def boot_cause_label(cause):
+    labels = {
+        'cold':    'Cold boot (power-on)',
+        'timer':   'Timer wake (5 min interval)',
+        'reed':    'Door reed switch wake',
+        'both':    'Timer + reed combined wake',
+        'tja1145': 'TJA1145 CAN activity wake',
+    }
+    return labels.get(cause, 'Unknown ({})'.format(cause))
 
 
-# ============================================================
+def tja1145_init():
+    pm = PowerManager()
+    pm._init_tja1145()
+
+
+# =============================================================================
 # PowerManager
-# ============================================================
+# =============================================================================
 
 class PowerManager:
-    """
-    Manages deep sleep entry based on WAKE_MODE config.
-
-    Usage:
-        pm = PowerManager()
-
-        # Check if engine-off timeout has elapsed:
-        if pm.should_sleep(trip_manager, engine_off_since):
-            pm.enter_sleep()
-
-        # enter_sleep() does not return — the ESP32 resets.
-    """
-
     def __init__(self):
         self.mode = WAKE_MODE
 
-    # ----------------------------------------------------------
-    # Sleep decision
-    # ----------------------------------------------------------
-
-    def should_sleep(self, trip_manager, engine_off_since_ms):
-        """
-        Returns True if conditions are met for deep sleep:
-
-        1. WAKE_MODE is not "none"
-        2. Engine has been off for >= SLEEP_AFTER_IDLE_MS
-        3. Trip is not active
-        """
-        if self.mode == "none":
-            return False
-
-        if trip_manager.trip_active:
-            return False
-
-        if engine_off_since_ms < SLEEP_AFTER_IDLE_MS:
-            return False
-
-        return True
-
-    # ----------------------------------------------------------
-    # Sleep entry
-    # ----------------------------------------------------------
+    # -------------------------------------------------------------------------
+    # Public API
+    # -------------------------------------------------------------------------
 
     def enter_sleep(self):
-        """
-        Enter deep sleep with configured wake sources.
-
-        Timer mode:   RTC magic = TIMER, sleep for SLEEP_WAKE_INTERVAL_MS
-        Reed mode:    RTC magic = GPIO, sleep forever, wake on GPIO
-        Both mode:    RTC magic = GPIO (primary), sleep for interval
-                      + GPIO wake on door open
-
-        This method does NOT return — machine.deepsleep()
-        resets the ESP32-S3.
-        """
-        if self.mode == "none":
-            return  # Should not reach here, but safety
-
-        # Store magic in RTC memory so next boot knows what to expect.
-        if self.mode == "timer":
-            _write_rtc_magic(_RTC_MAGIC_TIMER)
-        elif self.mode == "reed":
-            # Reed-only: sleep forever, GPIO must be the wake source
-            _write_rtc_magic(_RTC_MAGIC_GPIO)
-        else:
-            # "both" mode: can wake from timer OR GPIO —
-            # write BOTH magic so next boot knows to BLE-scan first
-            _write_rtc_magic(_RTC_MAGIC_BOTH)
-
-        # Configure GPIO wake if using reed switch
-        if self.mode in ("reed", "both"):
-            self._configure_gpio_wake()
-
-        # Enter deep sleep
-        if self.mode == "reed":
-            # Sleep forever — wake ONLY on reed switch GPIO
-            machine.deepsleep(0)
-        else:
-            # Timer or both: sleep for configured interval
+        if self.mode == 'tja1145':
+            # Cut power via TJA1145 (INH → input lets TJA1145 control buck EN).
+            # ESP32 then enters deep sleep. TJA1145 monitors CAN independently
+            # (~5µA) and drives INH HIGH when CAN activity is detected,
+            # re-enabling the buck converter to power the ESP32 back on.
+            self._tja1145_power_off()
+            # Enter deep sleep while TJA1145 monitors CAN.
+            # SLEEP_WAKE_INTERVAL_MS is a fallback wake timer in case
+            # TJA1145 INH doesn't wake the ESP32 (e.g. wiring issue).
+            print('[power] ESP32 deep sleeping — TJA1145 monitoring CAN')
             machine.deepsleep(SLEEP_WAKE_INTERVAL_MS)
+            return  # never reached
 
-    def _configure_gpio_wake(self):
-        """
-        Configure the reed switch GPIO as an ext0 wake source.
+        if self.mode == 'reed':
+            magic = _RTC_MAGIC_GPIO
+        elif self.mode == 'both':
+            magic = _RTC_MAGIC_BOTH
+        else:
+            magic = _RTC_MAGIC_TIMER
 
-        ext0 uses a single pin. The ESP32 wakes when the pin
-        matches REED_WAKE_LEVEL.
+        self._write_rtc_memory(magic)
 
-        Reed switch circuit (NO = Normally Open):
-            Door CLOSED: magnet holds reed closed → GPIO = LOW
-            Door OPENS:  reed opens → pull-up pulls GPIO HIGH → WAKE
-        """
-        try:
-            pin = machine.Pin(
-                REED_GPIO_PIN,
-                machine.Pin.IN,
-                machine.Pin.PULL_UP,
-            )
-            esp32.wake_on_ext0(pin, REED_WAKE_LEVEL)
-        except Exception as e:
-            print(f"[power] GPIO wake config failed: {e}")
-            # Fall through to timer-only sleep
+        if self.mode == 'reed':
+            print('[power] Deep sleep (reed wake, GPIO ext0)')
+            # Configure ext0 wake before sleeping
+            import config
+            pin = machine.Pin(config.REED_GPIO_PIN, machine.Pin.IN)
+            esp32.wake_on_ext0(pin=pin, level=config.REED_WAKE_LEVEL)
+            machine.deepsleep(0)
+        elif self.mode in ('timer', 'both'):
+            print('[power] Deep sleep (timer, {}ms)'.format(SLEEP_WAKE_INTERVAL_MS))
+            machine.deepsleep(SLEEP_WAKE_INTERVAL_MS)
+        else:
+            print('[power] Sleep disabled (WAKE_MODE=none)')
 
-    # ----------------------------------------------------------
-    # Timer-wake BLE scan decision
-    # ----------------------------------------------------------
-
-    def should_full_boot(self, wake_cause, obd):
-        """
-        Called at boot to decide whether to proceed with full boot
-        or go straight back to sleep.
-
-        Cold boot   → always full boot
-        GPIO wake   → always full boot (door was opened)
-        Timer wake  → quick BLE scan → iCar found? → boot : sleep
-        Both wake   → quick BLE scan → iCar found? → boot : sleep
-                      (can't tell if timer or GPIO, so scan first)
-        """
-        if wake_cause in ("cold", "gpio"):
+    def should_full_boot(self, wake_cause, obd_client=None):
+        if self.mode == 'tja1145':
+            return True  # TJA1145 only wakes on real CAN activity
+        if wake_cause == 'cold':
             return True
-
-        if wake_cause in ("timer", "both"):
-            print("[power] Timer wake — scanning for iCar Pro...")
-            found = obd.quick_scan(WAKE_BLE_SCAN_TIMEOUT)
-            if found:
-                print("[power] iCar Pro found → full boot")
+        if wake_cause in ('timer', 'both') and obd_client:
+            try:
+                print('[power] Wake detected -- quick BLE scan for iCar Pro...')
+                found = obd_client.quick_scan(timeout=3)
+                if found:
+                    print('[power] iCar Pro found -- proceeding with full boot')
+                    return True
+                else:
+                    print('[power] iCar Pro not found -- returning to sleep')
+                    return False
+            except Exception as e:
+                print('[power] BLE scan error: {} -- proceeding with full boot'.format(e))
                 return True
-            else:
-                print("[power] iCar Pro not found → back to sleep")
-                self.enter_sleep()
-                return False  # Never reached (sleep resets)
-
         return True
 
+    def should_sleep(self, trip_manager, engine_off_ms):
+        if self.mode == 'none':
+            return False
+        if SLEEP_AFTER_IDLE_MS <= 0:
+            return False
+        if trip_manager.trip_active:
+            return False
+        return engine_off_ms >= SLEEP_AFTER_IDLE_MS
 
-# ============================================================
-# Module-level convenience
-# ============================================================
+    # -------------------------------------------------------------------------
+    # Internal: wake cause detection
+    # -------------------------------------------------------------------------
 
-def boot_cause_label(cause):
-    """Human-readable boot cause label."""
-    return {
-        "cold":  "Cold boot (power-on)","timer":  "Timer wake (RTC alarm)",
-        "gpio":   "GPIO wake (reed switch / door open)",
-        "both":   "Both-mode wake (timer or GPIO)",
-    }.get(cause, f"Unknown ({cause})")
+    def _detect(self):
+        if self.mode == 'tja1145':
+            return 'tja1145'
+        magic = self._read_rtc_memory()
+        if magic == _RTC_MAGIC_TIMER:
+            return 'timer'
+        elif magic == _RTC_MAGIC_GPIO:
+            return 'reed'
+        elif magic == _RTC_MAGIC_BOTH:
+            return 'both'
+        return 'cold'
+
+    # -------------------------------------------------------------------------
+    # TJA1145 — INH-based hard power-off
+    # -------------------------------------------------------------------------
+
+    def _init_tja1145(self):
+        try:
+            # Drive STBY HIGH to put TJA1145 in normal operating mode
+            stby = machine.Pin(TJA1145_STBY_GPIO, machine.Pin.OUT)
+            stby.value(1)
+            print('[power] TJA1145 STBY = HIGH (normal mode)')
+
+            # Configure INT pin as input (optional diagnostics)
+            try:
+                int_pin = machine.Pin(TJA1145_INT_GPIO, machine.Pin.IN)
+                print('[power] TJA1145 INT pin configured (GPIO{})'.format(TJA1145_INT_GPIO))
+            except Exception:
+                pass
+
+            # Release INH pin — let TJA1145 take full control of buck enable.
+            # INH is open-drain on TJA1145, so setting ESP32 pin to INPUT
+            # allows TJA1145 to drive it LOW (CAN silent) or HIGH (CAN active).
+            inh = machine.Pin(TJA1145_INH_GPIO, machine.Pin.IN)
+            print('[power] TJA1145 INH released (GPIO{} → INPUT)'.format(TJA1145_INH_GPIO))
+        except Exception as e:
+            print('[power] TJA1145 init error: {}'.format(e))
+
+    def _tja1145_power_off(self):
+        # Prepare INH pin for TJA1145 open-drain control.
+        # In normal mode (STBY=HIGH), TJA1145 drives INH HIGH.
+        # Setting ESP32 INH pin to INPUT allows TJA1145 to control it.
+        # The actual power cut to ESP32 comes from machine.deepsleep()
+        # (VCC removed), not from this function. The TJA1145 continues
+        # monitoring CAN independently and drives INH HIGH to wake ESP32.
+        try:
+            inh = machine.Pin(TJA1145_INH_GPIO, machine.Pin.IN)
+            print('[power] TJA1145 INH released — ESP32 entering deep sleep')
+            print('[power] TJA1145 monitoring CAN (~5µA standby)')
+        except Exception as e:
+            print('[power] Failed to configure TJA1145 INH: {}'.format(e))
+            self._fallback_deepsleep()
+
+    def _fallback_deepsleep(self):
+        print('[power] TJA1145 fallback — entering regular deep sleep')
+        machine.deepsleep(SLEEP_WAKE_INTERVAL_MS)
+
+    # -------------------------------------------------------------------------
+    # RTC Memory Helpers (non-TJA1145 modes only)
+    # -------------------------------------------------------------------------
+
+    def _write_rtc_memory(self, magic):
+        try:
+            rtc_mem = esp32.RTC_SLOW_MEM
+            rtc_mem[:len(magic)] = magic
+        except Exception as e:
+            print('[power] RTC memory write error: {}'.format(e))
+
+    def _read_rtc_memory(self):
+        try:
+            rtc_mem = esp32.RTC_SLOW_MEM
+            return bytes(rtc_mem[:4])
+        except Exception:
+            return b'\u0000\u0000\u0000\u0000'

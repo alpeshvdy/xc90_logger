@@ -36,7 +36,59 @@ from power_manager import (
     PowerManager,
     detect_boot_cause,
     boot_cause_label,
+    tja1145_init,
 )
+
+
+async def boot():
+    """
+    Full boot sequence — upload and BLE run in parallel.
+    Upload fires immediately so data reaches Google Sheets
+    the moment you bring the ESP32 home.
+    BLE retries forever until the iCar Pro is in range.
+
+    TJA1145 mode: every boot is a real CAN wake event.
+    No early BLE scan needed — TJA1145 only powers on ESP32
+    when CAN activity is detected (door unlock, key proximity, engine start).
+
+    Timer mode: quick BLE scan on wake to check if car is on.
+    If iCar is not advertising, straight back to deep sleep.
+
+    Returns (obd, trip_manager, log_buffer,
+             sensor_state, wifi_manager, pre_start_buffer, power_manager)
+    or raises on unrecoverable failure.
+    """
+    print("\n" + "="*40)
+    print(" XC90 OBD Logger")
+    print(" Firmware v" + FW_VERSION)
+    print("="*40 + "\n")
+
+    # 0. Detect boot cause
+    wake_cause = detect_boot_cause()
+    print("[boot] Boot cause: %s (mode: %s)"
+          % (boot_cause_label(wake_cause), WAKE_MODE))
+
+    # 0b. TJA1145: initialize CAN transceiver control pins
+    # This runs on every boot (including TJA1145 hard power-on from CAN wake)
+    if WAKE_MODE == "tja1145":
+        tja1145_init()
+
+    power_manager = PowerManager()
+
+    # 0c. Timer-wake mode only: quick BLE scan to check if car is on
+    # TJA1145 skips this — all TJA1145 boots are valid CAN wake events
+    if wake_cause == "timer":
+        temp_ble = OBDClient()
+        if not power_manager.should_full_boot(wake_cause, temp_ble):
+            temp_ble._ble.active(False)
+            # should_full_boot returned False → iCar Pro not found → go back to sleep
+            # enter_sleep() calls machine.deepsleep() → ESP32 resets, never returns
+            power_manager.enter_sleep()
+        temp_ble._ble.active(False)
+    elif wake_cause == "reed":
+        print("[boot] Door opened — proceeding with full boot")
+    elif wake_cause == "cold":
+        print("[boot] Cold boot — proceeding with full boot")
 
 class SensorState:
     """
@@ -306,21 +358,15 @@ async def boot():
     print(" Firmware v" + FW_VERSION)
     print("="*40 + "\n")
 
-    # 0. Detect boot cause and decide whether to full boot
+    # 0. Detect boot cause
     wake_cause = detect_boot_cause()
-    power_manager = PowerManager()
     print("[boot] Boot cause: %s (mode: %s)"
           % (boot_cause_label(wake_cause), WAKE_MODE))
 
-    if wake_cause == "timer":
-        # Quick BLE scan before full init — is the car awake?
-        temp_ble = OBDClient()
-        if not power_manager.should_full_boot(wake_cause, temp_ble):
-            # iCar not found → enter_sleep() resets ESP32, never returns
-            pass
-        temp_ble._ble.active(False)
-    elif wake_cause == "gpio":
-        print("[boot] Door opened — waking for full boot")
+    # 0b. TJA1145 mode: initialise the CAN transceiver control pins
+    # This runs on every boot (including TJA1145 hard power-on)
+    if WAKE_MODE == "tja1145":
+        tja1145_init()
 
     # 1. Initialise storage
     print("[boot] Initialising storage...")
