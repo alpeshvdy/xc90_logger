@@ -15,6 +15,7 @@ from config import (
     FW_VERSION,
     VIN_PARTIAL,
     UTC_OFFSET_HOURS,
+    PRE_START_BUFFER_ROWS,
 )
 from decoder import calculate_derived
 
@@ -390,4 +391,54 @@ class LogBuffer:
 
     def pending(self):
         """How many rows are waiting in buffer."""
+        return len(self._buffer)
+
+
+class PreStartBuffer:
+    """
+    Circular buffer of engine-off rows kept in RAM only.
+    When engine starts, these rows are flushed before engine-on rows,
+    capturing the transition from off → on.
+
+    No flash writes while engine is off — saves flash wear.
+    """
+
+    def __init__(self, max_rows=None):
+        self._buffer = []
+        self._max = max_rows or PRE_START_BUFFER_ROWS
+
+    def add(self, row):
+        """Add engine-off row. Drops oldest when buffer full."""
+        self._buffer.append(row)
+        if len(self._buffer) > self._max:
+            self._buffer.pop(0)
+
+    def flush_to(self, log_buffer, trip_manager):
+        """
+        Flush all pre-start rows to the main LogBuffer.
+        Re-stamps each row with the current trip's ID and sequence
+        so they integrate cleanly into the trip timeline.
+
+        These get written to flash before the first engine-on row,
+        capturing the transition from engine-off → on.
+
+        Returns number of rows flushed.
+        """
+        count = len(self._buffer)
+        if count == 0:
+            return 0
+
+        print("[logger] Flushing %d pre-start rows (engine-off → on transition)" % count)
+        for row in self._buffer:
+            row["trip_id"] = trip_manager.trip_id
+            row["trip_sequence"] = trip_manager.next_sequence()
+            row["engine_state"] = "pre_start"
+            row["sample_tier"] = "pre_start"
+            log_buffer.add(row)
+
+        self._buffer.clear()
+        return count
+
+    def pending(self):
+        """How many pre-start rows are buffered."""
         return len(self._buffer)

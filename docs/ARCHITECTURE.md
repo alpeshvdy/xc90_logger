@@ -4,6 +4,7 @@
 > **Hardware:** ESP32-S3-WROOM-1 (LOLIN S3 Pro)  
 > **Firmware:** MicroPython v1.28.0 Lolin-specific  
 > **Output:** Google Sheets (via HTTPS webhook)
+> **Power:** Deep sleep + dual wake (timer / reed GPIO) — see `POWER_MANAGEMENT.md`
 
 ---
 
@@ -18,7 +19,8 @@
 7. [BLE Auto-Discovery](#7-ble-auto-discovery)
 8. [Trip Detection Logic](#8-trip-detection-logic)
 9. [Upload Pipeline](#9-upload-pipeline)
-10. [File Map](#10-file-map)
+10. [Power Management](#10-power-management)
+11. [File Map](#11-file-map)
 
 ---
 
@@ -45,9 +47,12 @@
 **Purpose:** Log 20+ OBD-II/Enhanced PIDs from the XC90's ECU continuously, buffer to flash, and auto-upload to Google Sheets when WiFi is available.
 
 **Key design decisions:**
-- **Async concurrency** — 7 `uasyncio` tasks run simultaneously (4 samplers + trip monitor + upload + connection watchdog)
+- **Async concurrency** — 3 `uasyncio` tasks run simultaneously (sampler + upload + connection watchdog)
+- **Single sequential sampler** — Torque Pro method: one PID at a time, no collisions, no ELM327 mode corruption
 - **RAM buffer** — 50 rows buffered before flash write (reduces flash wear)
+- **Pre-start buffer** — Up to 12 engine-off rows kept in RAM, flushed on engine start (captures off→on transition)
 - **Three-tier BLE discovery** — works with any ELM327 BLE adapter, not just iCar Pro
+- **Deep sleep + dual wake** — Timer (RTC) or reed switch (GPIO) wake; saves 99%+ battery while parked
 - **Offline-first** — logs locally even without WiFi; uploads next time you're home
 
 ---
@@ -62,97 +67,96 @@
                                          │
                                          ▼
                                 ┌─────────────────┐
-                                │  main.py:boot() │
+                                │  Detect Boot     │
+                                │  Cause            │
+                                │  (cold/timer/gpio)│
                                 └────────┬────────┘
                                          │
-                    ┌────────────────────┼────────────────────┐
-                    ▼                    ▼                    ▼
-            ┌──────────────┐    ┌──────────────┐    ┌──────────────┐
-            │ Init Storage │    │ Init OBD      │    │ Init WiFi    │
-            │ (logger.py)  │    │ (obd.py)      │    │ (uploader.py)│
-            └──────┬───────┘    └──────┬───────┘    └──────┬───────┘
-                   │                   │                   │
-                   ▼                   │                   ▼
-            ┌──────────────┐           │           ┌──────────────┐
-            │ /logs/ dir   │           │           │ Background   │
-            │ CSV rotation │           │           │ Upload Task  │
-            └──────────────┘           │           │ (prev trips) │
-                                       │           └──────────────┘
-                                       │
-                    ┌──────────────────┘
-                    ▼
-            ┌──────────────────┐
-            │ BLE Connection   │◄──── RETRY FOREVER (3s interval)
-            │ 3-Tier Discovery │
-            └────────┬─────────┘
-                     │
-                     ▼ (connected)
-            ┌──────────────────┐
-            │ PID Probe        │  First boot only — test enhanced PIDs
-            │ (engine running) │  Saves → /logs/pid_probe.json
-            └────────┬─────────┘
-                     │
-                     ▼
-     ┌───────────────┴───────────────────────────────────────┐
-     │              LAUNCH 7 ASYNC TASKS                      │
-     │                                                        │
-     │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │
-     │  │ Critical │ │ Standard │ │  Slow    │ │ Enhanced │ │
-     │  │ Sampler  │ │ Sampler  │ │ Sampler  │ │ Sampler  │ │
-     │  │  (1s)    │ │  (2s)    │ │  (5s)    │ │ (10s)    │ │
-     │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │
-     │       │            │            │            │        │
-     │       └────────────┴────────────┴────────────┘        │
-     │                         │                              │
-     │                         ▼                              │
-     │              ┌──────────────────┐                      │
-     │              │  SensorState     │   Shared dict        │
-     │              │  (shared cache)  │   of latest values   │
-     │              └────────┬─────────┘                      │
-     │                       │                                │
-     │         ┌─────────────┼─────────────┐                  │
-     │         ▼             ▼             ▼                  │
-     │  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
-     │  │ Trip     │  │ build_row│  │ Dispatch │             │
-     │  │ Monitor  │  │ (CSV row)│  │ to Tier  │             │
-     │  │ (1s)     │  └────┬─────┘  └──────────┘             │
-     │  └────┬─────┘       │                                   │
-     │       │             ▼                                   │
-     │       │      ┌────────────┐                             │
-     │       │      │ LogBuffer  │  RAM buffer (50 rows)       │
-     │       │      │ .add(row)  │                             │
-     │       │      └─────┬──────┘                             │
-     │       │            │ (flush when full)                  │
-     │       │            ▼                                    │
-     │       │      ┌────────────┐                             │
-     │       │      │ /logs/     │  CSV on flash               │
-     │       │      │ xc90_NNN   │                             │
-     │       │      └─────┬──────┘                             │
-     │       │            │                                    │
-     │       ▼            │                                    │
-     │  ┌──────────┐      │                                    │
-     │  │ Trip End │      │                                    │
-     │  │ Flush    │──────┘                                    │
-     │  └──────────┘                                           │
-     │                                                         │
-     │  ┌──────────┐  ┌──────────┐                             │
-     │  │ Upload   │  │Connection│                             │
-     │  │ Task     │  │ Watchdog │                             │
-     │  │ (5min)   │  │ (5s)     │                             │
-     │  └──────────┘  └──────────┘                             │
-     │                                                         │
-     └─────────────────────────────────────────────────────────┘
-                     │
-                     ▼
-              RUN FOREVER
-              (until power loss / Ctrl+C)
-                     │
-                     ▼
-              ┌──────────────┐
-              │ Flush Buffer │
-              │ Upload Last  │
-              │ Clean Exit   │
-              └──────────────┘
+                          ┌──────────────┼──────────────┐
+                          │ timer        │ cold/gpio     │
+                          ▼              │               │
+                   ┌──────────────┐      │               │
+                   │ Quick BLE    │      │               │
+                   │ Scan (3s)    │      │               │
+                   └──────┬───────┘      │               │
+                          │              │               │
+              iCar found? │              │               │
+              ┌─────NO────┘              │               │
+              │ YES                     │               │
+              ▼                         ▼               ▼
+       ┌──────────────┐          ┌─────────────────────────┐
+       │ Deep Sleep   │          │  main.py:boot()         │
+       │ (ESP resets) │          └───────────┬─────────────┘
+       └──────────────┘                      │
+                                  ┌──────────┼──────────┐
+                                  ▼          ▼          ▼
+                          ┌──────────┐ ┌──────────┐ ┌──────────┐
+                          │Init Store│ │Init OBD  │ │Init WiFi │
+                          │(logger)  │ │(obd)     │ │(uploader)│
+                          └────┬─────┘ └────┬─────┘ └────┬─────┘
+                               │            │            │
+                               ▼            ▼            ▼
+                          ┌──────────┐ ┌──────────┐ ┌──────────┐
+                          │ /logs/   │ │ BLE Scan │ │Background│
+                          │ CSV rot. │ │ & Connect│ │ Upload   │
+                          └──────────┘ └────┬─────┘ └──────────┘
+                                            │
+                                 ┌──────────┘
+                                 ▼
+                          ┌──────────────┐
+                          │ BLE Connect  │◄── RETRY FOREVER
+                          │ (3 Tiers)    │
+                          └──────┬───────┘
+                                 │
+                                 ▼
+                ┌────────────────┴────────────────────┐
+                │       LAUNCH 3 ASYNC TASKS          │
+                │                                      │
+                │  ┌──────────────────────────────┐   │
+                │  │  Sequential Sampler          │   │
+                │  │  (1 row/second)              │   │
+                │  │  • Critical PIDs every cycle │   │
+                │  │  • Standard PIDs every 2nd   │   │
+                │  │  • Slow PIDs every 5th       │   │
+                │  │  • Trip detection inline     │   │
+                │  │  • Pre-start buffer (RAM)    │   │
+                │  │  • Sleep trigger on idle     │   │
+                │  └──────────────┬───────────────┘   │
+                │                 │                    │
+                │                 ▼                    │
+                │  ┌──────────────────────────────┐   │
+                │  │  SensorState (shared cache)  │   │
+                │  │  Forward-filled values       │   │
+                │  └──────────────┬───────────────┘   │
+                │                 │                    │
+                │                 ▼                    │
+                │  ┌──────────────────────────────┐   │
+                │  │  build_row → LogBuffer       │   │
+                │  │  (50-row RAM → flash)        │   │
+                │  └──────────────┬───────────────┘   │
+                │                 │                    │
+                │                 ▼                    │
+                │  ┌──────────────────────────────┐   │
+                │  │  /logs/xc90_NNN.csv          │   │
+                │  └──────────────────────────────┘   │
+                │                                      │
+                │  ┌──────────┐  ┌──────────┐        │
+                │  │ Upload   │  │Connection│        │
+                │  │ Task     │  │ Watchdog │        │
+                │  │ (5min)   │  │ (5s)     │        │
+                │  └──────────┘  └──────────┘        │
+                └─────────────────────────────────────┘
+                                 │
+                                 ▼
+                          RUN FOREVER
+                          (until power loss / Ctrl+C)
+                                 │
+                                 ▼
+                          ┌──────────────┐
+                          │ Flush Buffer │
+                          │ Upload Last  │
+                          │ Clean Exit   │
+                          └──────────────┘
 ```
 
 ---
@@ -164,44 +168,47 @@
 │                          main.py                                 │
 │                    (Orchestrator / Entry Point)                   │
 │                                                                  │
-│  boot() → init all modules → BLE connect → PID probe → tasks    │
-│  main() → boot() → launch 7 async tasks → asyncio.gather()      │
-└───────┬──────┬────────┬──────────┬──────────┬───────────────────┘
-        │      │        │          │          │
-        ▼      ▼        ▼          ▼          ▼
-┌───────┐ ┌───────┐ ┌────────┐ ┌────────┐ ┌──────────┐
-│config │ │ pids  │ │decoder │ │logger  │ │uploader  │
-│.py    │ │.py    │ │.py     │ │.py     │ │.py       │
-│       │ │       │ │        │ │        │ │          │
-│WiFi   │ │PID    │ │Raw→Val │ │Trip    │ │WiFi Mgr  │
-│BLE    │ │defs   │ │pipeline│ │detect  │ │HTTPS POST│
-│sample │ │tiers  │ │        │ │CSV row │ │cleanup   │
-│rates  │ │       │ │        │ │buffer  │ │health    │
-└───────┘ └───────┘ └────────┘ └────────┘ └──────────┘
-                                       │
-                                       ▼
-                                  ┌──────────┐
-                                  │  obd.py  │
-                                  │          │
-                                  │BLE client│
-                                  │AT init   │
-                                  │PID query │
-                                  │3-tier    │
-                                  │discovery │
-                                  └──────────┘
+│  boot() → detect wake cause → quick scan (if timer) →            │
+│           init all modules → BLE connect → 3 async tasks         │
+│  main() → boot() → launch tasks → asyncio.gather()              │
+└───┬──────┬──────┬────────┬──────────┬──────────┬───────────────┘
+    │      │      │        │          │          │
+    ▼      ▼      ▼        ▼          ▼          ▼
+┌───────┐┌──────┐┌──────┐┌──────┐┌──────────┐┌──────────────┐
+│config ││pids  ││decoder││logger││uploader  ││power_manager │
+│.py    ││.py   ││.py   ││.py   ││.py       ││.py           │
+│       ││      ││      ││      ││          ││              │
+│WiFi   ││PID   ││Raw→Val││Trip  ││WiFi Mgr  ││Deep Sleep    │
+│BLE    ││defs  ││derived││detect││HTTPS POST││Timer/GPIO    │
+│sample ││tiers ││pids   ││CSV   ││cleanup   ││Wake Modes    │
+│sleep  ││      ││      ││buf   ││health    ││RTC Memory    │
+└───────┘└──────┘└──────┘└──────┘└──────────┘└──────────────┘
+                                   │
+                                   ▼
+                              ┌──────────┐
+                              │  obd.py  │
+                              │          │
+                              │BLE client│
+                              │AT init   │
+                              │PID query │
+                              │quick_scan│
+                              │3-tier    │
+                              │discovery │
+                              └──────────┘
 ```
 
 ### Module Responsibilities
 
 | Module | Role | Key Classes/Functions |
 |--------|------|----------------------|
-| **`config.py`** | All configuration constants | WiFi, BLE, sampling rates, storage limits |
-| **`pids.py`** | PID definitions (20 PIDs in 4 tiers) | `CRITICAL_PIDS`, `STANDARD_PIDS`, `SLOW_PIDS`, `ENHANCED_PIDS`, `PIDS_BY_TIER` |
-| **`decoder.py`** | Raw ELM327 → decoded value pipeline | `decode()`, `clean_response()`, `extract_bytes()`, `validate_range()` |
-| **`obd.py`** | BLE connection + ELM327 protocol | `OBDClient` class: `connect()`, `query()`, `_scan_for_obd_by_service()` |
-| **`logger.py`** | Trip detection + CSV logging | `TripManager`, `LogBuffer`, `build_row()`, `classify_engine_state()` |
+| **`config.py`** | All configuration constants | WiFi, BLE, sampling rates, sleep/wake, storage limits |
+| **`pids.py`** | PID definitions (22 PIDs in 3 tiers) | `PIDS_BY_TIER`, `ALL_PIDS` |
+| **`decoder.py`** | Raw ELM327 → decoded value + derived PIDs | `decode()`, `calculate_derived()`, `clean_response()` |
+| **`obd.py`** | BLE connection + ELM327 protocol + quick scan | `OBDClient` class: `connect()`, `query()`, `quick_scan()` |
+| **`logger.py`** | Trip detection + CSV logging + pre-start buffer | `TripManager`, `LogBuffer`, `PreStartBuffer`, `build_row()` |
 | **`uploader.py`** | WiFi + Google Sheets HTTPS upload | `WiFiManager`, `upload_pending()`, `_http_post_json()` |
-| **`main.py`** | Async orchestrator | `boot()`, `main()`, `sampler_task()`, 7 concurrent `uasyncio` tasks |
+| **`power_manager.py`** | Deep sleep + dual wake (timer / GPIO) | `PowerManager`, `detect_boot_cause()`, `boot_cause_label()` |
+| **`main.py`** | Async orchestrator (3 concurrent tasks) | `boot()`, `main()`, `sampler_sequential()`, `SensorState` |
 
 ---
 
@@ -352,69 +359,84 @@ main.py:main() continues:
 
 ## 6. Sampling System
 
-### 6.1 Four Tiers
+### 6.1 Single Sequential Sampler (Torque Pro Method)
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  TIER         │ INTERVAL │ PIDs                                │
-├───────────────┼──────────┼─────────────────────────────────────┤
-│  critical     │   1s     │ rpm, coolant_temp_c, boost_actual,  │
-│               │          │ vehicle_speed_kph                    │
-├───────────────┼──────────┼─────────────────────────────────────┤
-│  standard     │   2s     │ engine_load_pct, throttle_pos_pct,  │
-│               │          │ stft_pct, ltft_pct, maf_g_s,        │
-│               │          │ intake_air_temp_c                    │
-├───────────────┼──────────┼─────────────────────────────────────┤
-│  slow         │   5s     │ oil_temp_c, battery_voltage_v,      │
-│               │          │ baro_pressure_kpa, fuel_trim_sum*   │
-├───────────────┼──────────┼─────────────────────────────────────┤
-│  enhanced     │  10s     │ boost_target_kpa, boost_delta_kpa*, │
-│               │          │ turbo_inlet_pres, oil_pressure_kpa  │
-│               │          │                                     │
-│               │          │ * = derived (calculated, not OBD)   │
-└───────────────┴──────────┴─────────────────────────────────────┘
+│  CYCLE │ PIDs Queried                                           │
+├────────┼────────────────────────────────────────────────────────┤
+│  Every │ rpm, coolant_temp_c, boost_actual_kpa,                 │
+│  cycle │ vehicle_speed_kph (4 critical PIDs)                    │
+├────────┼────────────────────────────────────────────────────────┤
+│  Every │ engine_load_pct, throttle_pos_pct, stft_pct,           │
+│  2nd   │ ltft_pct, maf_g_s, intake_air_temp_c,                  │
+│  cycle │ timing_advance_deg, fuel_system_status,                 │
+│        │ o2_lambda, absolute_load_pct (8 standard PIDs)         │
+├────────┼────────────────────────────────────────────────────────┤
+│  Every │ oil_temp_c, battery_voltage_v, baro_pressure_kpa,      │
+│  5th   │ fuel_pressure_kpa, ambient_air_temp_c,                 │
+│  cycle │ engine_run_time_s, dtc_count, fuel_rate_l_h,           │
+│        │ fuel_trim_sum*, iat_ambient_delta_c* (8+2 PIDs)        │
+│        │                                                        │
+│        │ * = derived (calculated, not OBD)                      │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-### 6.2 Sampler Task Logic
+### 6.2 Sampler Logic
 
 ```
-sampler_task(obd, trip_manager, log_buffer, sensor_state, tier):
-  │
-  ├── Get PIDs and interval for this tier
+sampler_sequential(obd, trip_manager, log_buffer, sensor_state,
+                   pre_start_buffer, power_manager):
   │
   └── while True:
         │
-        ├── If not trip_active AND tier != "critical":
-        │     sleep(IDLE_POLL_INTERVAL)  ← 5s poll when engine off
-        │     continue
+        ├── IDLE MODE (trip NOT active):
+        │     ├── Query critical PIDs every IDLE_POLL_INTERVAL (5s)
+        │     ├── Build pre-start rows → PreStartBuffer (RAM only)
+        │     ├── Run trip detection (check RPM > 100)
+        │     │
+        │     ├── Track engine-off time
+        │     ├── After SLEEP_AFTER_IDLE_MS (30 min) of 0 RPM:
+        │     │     └── power_manager.enter_sleep() → ESP resets
+        │     │
+        │     └── Trip detected? → continue to ACTIVE MODE
         │
-        ├── If not obd.is_connected():
-        │     sleep(1)
-        │     continue
-        │
-        ├── for each pid_name, pid_def in tier's PIDs:
-        │     │
-        │     ├── Skip derived PIDs (cmd is None)
-        │     │
-        │     ├── result = obd.query(pid_name)
-        │     │     │
-        │     │     └── Switch enhanced/standard CAN mode as needed
-        │     │
-        │     ├── sensor_state.update(pid_name, result)
-        │     │
-        │     ├── row = build_row(
-        │     │       trip_manager,
-        │     │       sensor_state.get_all(),  ← ALL tiers' latest values
-        │     │       tier, pid_def["cmd"],
-        │     │       result["raw"], result["status"]
-        │     │     )
-        │     │
-        │     └── log_buffer.add(row)
-        │
-        └── sleep(interval)
+        └── ACTIVE MODE (trip active):
+              ├── First active cycle: flush PreStartBuffer
+              │     └── Rows re-stamped with trip_id + sequence
+              │
+              ├── Query critical PIDs (every cycle, 1s)
+              ├── Query standard PIDs (every 2nd cycle)
+              ├── Query slow PIDs (every 5th cycle)
+              │
+              ├── trip_manager.update(rpm, speed)
+              │
+              ├── Build ONE dense row with SensorState.get_all()
+              │     └── All columns forward-filled → AI-ready
+              │
+              └── log_buffer.add(row)
+                    └── Flush to flash when BUFFER_SIZE reached
 ```
 
-### 6.3 SensorState — Shared Value Cache
+### 6.3 Pre-Start Buffer
+
+```
+ENGINE OFF (hours)                    ENGINE ON (drive)
+┌──────────────────────────┐    ┌──────────────────────────────┐
+│ Sample every 5s          │    │ Sample every 1s              │
+│ Keep last 12 rows in RAM │    │ Write every row to flash     │
+│ → PreStartBuffer         │    │                              │
+│ → NO flash wear          │    │                              │
+│         ↓                │    │                              │
+│   [row -60s]             │    │                              │
+│   [row -55s]    ← FLUSH →│    │ [row 0s] ← first engine-on   │
+│   [row -50s]    at start │    │ [row 1s]                     │
+│   ...                    │    │ [row 2s]                     │
+│   [row -5s]              │    │ ...                          │
+└──────────────────────────┘    └──────────────────────────────┘
+
+Rows tagged engine_state = "pre_start" for easy AI filtering.
+```
 
 ```
                     ┌─────────────────────┐
@@ -428,14 +450,15 @@ sampler_task(obd, trip_manager, log_buffer, sensor_state, tier):
     standard ──────►│  stft_pct: -2.3     │
     standard ──────►│  ltft_pct: 3.1      │
     standard ──────►│  maf_g_s: 42.5      │
+    standard ──────►│  timing_adv: 12.5   │
     ...              │  ...               │
     slow ──────────►│  oil_temp_c: 98     │
     slow ──────────►│  battery: 14.1      │
     slow ──────────►│  baro: 101          │
+    slow ──────────►│  fuel_rate: 5.2     │
     ...              │  ...               │
-    enhanced ──────►│  boost_target: 120  │
-    enhanced ──────►│  turbo_inlet: 100   │
-    enhanced ──────►│  oil_pressure: 340  │
+    derived ───────►│  fuel_trim_sum: 0.8 │
+    derived ───────►│  iat_ambient_delta:5│
                     │                     │
                     │  get_all() → dict   │──► build_row() includes ALL values
                     │  get("rpm") → 1726  │     in every row, even if some tiers
@@ -654,20 +677,87 @@ _http_post_json(url, body):
 
 ---
 
-## 10. File Map
+## 10. Power Management
+
+See the full guide: [`POWER_MANAGEMENT.md`](./POWER_MANAGEMENT.md)
+
+### 10.1 Wake Modes
+
+| Mode | Wake Source | Hardware | Parked Draw |
+|------|------------|----------|-------------|
+| `"timer"` | RTC alarm every 5 min | None | ~15.5 mAh/day |
+| `"reed"` | GPIO ext0 (door reed switch) | $1 reed + magnet | ~0.98 mAh/day |
+| `"both"` | GPIO primary + timer fallback | $1 reed + magnet | ~1.0 mAh/day |
+| `"none"` | Never sleeps | None | ~1355 mAh/day |
+
+### 10.2 Sleep Entry
+
+```
+sampler_sequential idle loop:
+  │
+  ├── Track engine_off_at timestamp
+  ├── After SLEEP_AFTER_IDLE_MS (30 min) of 0 RPM:
+  │     └── power_manager.enter_sleep()
+  │           ├── Write RTC magic (XC91=timer, XC92=GPIO)
+  │           ├── Configure GPIO wake (if reed/both mode)
+  │           └── machine.deepsleep(ms)
+  │                 ESP32-S3 resets
+  │
+  └── Next boot: detect_boot_cause() → cold/timer/gpio
+```
+
+### 10.3 Boot Cause Detection
+
+```
+detect_boot_cause():
+  │
+  ├── machine.reset_cause() == PWRON_RESET → "cold"
+  │
+  └── machine.reset_cause() == DEEPSLEEP_RESET:
+        ├── RTC memory == XC91 → "timer"
+        ├── RTC memory == XC92 → "gpio"
+        └── Unknown → "cold"
+```
+
+### 10.4 Boot Decision Flow
+
+| Boot Cause | Action |
+|-----------|--------|
+| `"cold"` | Full boot (power-on) |
+| `"gpio"` | Full boot (door opened) |
+| `"timer"` | Quick BLE scan → iCar found? → full boot : re-sleep |
+
+### 10.5 Reed Switch Circuit
+
+```
+   3.3V ── 100kΩ ──┬── GPIO4 (RTC wake)
+                    │
+              Reed Switch (NO)
+                    │
+                   GND
+
+Door CLOSED: magnet holds reed closed → GPIO = LOW
+Door OPENS:  reed opens → pull-up pulls HIGH → ESP32 WAKES
+```
+
+---
+
+## 11. File Map
 
 ```
 xc90_logger/
 │
-├── main.py              Orchestrator — boot sequence, 7 async tasks
-├── config.py            All constants (WiFi, BLE, sampling, storage)
-├── pids.py              PID definitions (20 PIDs across 4 tiers)
-├── decoder.py           ELM327 raw response → decoded value pipeline
-├── obd.py               BLE client — 3-tier discovery, AT init, PID query
-├── logger.py            Trip detection, CSV row building, flash buffer
+├── config.py            All constants (WiFi, BLE, sampling, sleep/wake, storage)
+├── decoder.py           ELM327 raw response → decoded value + derived PIDs
+├── logger.py            Trip detection, CSV row building, flash buffer, PreStartBuffer
+├── main.py              Orchestrator — boot sequence, sequential sampler, 3 async tasks
+├── obd.py               BLE client — 3-tier discovery, AT init, PID query, quick_scan
+├── pids.py              PID definitions (22 Mode 01 PIDs across 3 tiers + 2 derived)
+├── power_manager.py     Deep sleep & dual wake (timer / reed GPIO)
 ├── uploader.py          WiFi manager, HTTPS POST, cleanup, health checks
 │
-├── code.gs              Google Apps Script — webhook receiver
+├── deploy/
+│   └── code.gs          Google Apps Script — webhook receiver
 │
 ├── tests/
 │   ├── __init__.py
@@ -680,17 +770,15 @@ xc90_logger/
 │   ├── fix_com_port.py           COM port diagnostic
 │   └── troubleshoot_connection.py Connection debugger
 │
-├── ESP32-S3-WROOM-1_REFERENCE.md  Hardware reference (pin map, power, BLE specs)
-├── ARCHITECTURE.md                ← THIS FILE
-├── DEPLOYMENT_GUIDE.md            Step-by-step flashing + deploy
-├── QUICK_START.md                 Fast deploy for LOLIN Pro
-├── WEBHOOK_SETUP.md               Google Sheets Apps Script setup
-├── PID_VALIDATION_GUIDE.md        How to validate enhanced PIDs
-├── FIRST_TEST.md                  First test instructions
+├── docs/                # Documentation
+│   ├── ARCHITECTURE.md
+│   ├── POWER_MANAGEMENT.md
+│   ├── SCHEMA.md
+│   ├── DEPLOYMENT_GUIDE.md
+│   └── ...
 │
-├── diagram.json          Wokwi simulator diagram
-├── wokwi.toml            Wokwi config
-├── wokwi_test.py         Simulator test script
+├── hw/                  Hardware reference
+│   └── ESP32-S3-WROOM-1_REFERENCE.md
 │
 └── xc90_001.csv          Sample captured log data
 ```
@@ -702,11 +790,11 @@ xc90_logger/
                     │ config   │◄──── All modules import from here
                     └────┬─────┘
                          │
-          ┌──────────────┼──────────────┐
-          │              │              │
-    ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐
-    │ pids.py   │  │ logger.py │  │uploader.py│
-    └─────┬─────┘  └─────┬─────┘  └───────────┘
+          ┌──────────────┼──────────────┬──────────────┐
+          │              │              │              │
+    ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼─────┐  ┌─────▼──────────┐
+    │ pids.py   │  │ logger.py │  │uploader.py│  │power_manager.py│
+    └─────┬─────┘  └─────┬─────┘  └───────────┘  └────────────────┘
           │              │
     ┌─────▼─────┐        │
     │ decoder.py│        │
@@ -727,23 +815,29 @@ xc90_logger/
 
 | Parameter | Value | Config Key |
 |-----------|-------|-----------|
-| Critical sample rate | 1s | `SAMPLE_RATE_CRITICAL` |
-| Standard sample rate | 2s | `SAMPLE_RATE_STANDARD` |
-| Slow sample rate | 5s | `SAMPLE_RATE_SLOW` |
-| Enhanced sample rate | 10s | `SAMPLE_RATE_ENHANCED` |
+| Critical sample rate | 1s | `ROW_INTERVAL_MS` |
+| Standard sample rate | 2s (every 2nd cycle) | (derived) |
+| Slow sample rate | 5s (every 5th cycle) | (derived) |
 | RAM buffer flush | 50 rows | `BUFFER_SIZE` |
 | Max log file size | 512 KB | `MAX_LOG_SIZE_KB` |
 | Trip start threshold | RPM ≥ 100 | `TRIP_START_RPM` |
 | Trip end debounce | 10 seconds | `TRIP_END_DELAY` |
-| Upload interval | 5 minutes | `UPLOAD_INTERVAL` |
+| Idle poll interval | 5 seconds | `IDLE_POLL_INTERVAL` |
+| Pre-start buffer rows | 12 (~60s) | `PRE_START_BUFFER_ROWS` |
+| Sleep after idle | 30 minutes | `SLEEP_AFTER_IDLE_MS` |
+| Wake interval (timer) | 5 minutes | `SLEEP_WAKE_INTERVAL_MS` |
+| BLE scan on wake | 3 seconds | `WAKE_BLE_SCAN_TIMEOUT` |
+| Upload interval | 5 minutes | (hardcoded in upload_task) |
 | Uploaded file retention | 3 days | `MAX_UPLOADED_AGE_DAYS` |
 | BLE connect timeout | 10 seconds | `BLE_CONNECT_TIMEOUT` |
-| BLE probe per device | 5 seconds | `BLE_PROBE_PER_DEVICE_TIMEOUT` |
 | WiFi timeout | 10 seconds | `WIFI_TIMEOUT` |
-| HTTPS redirect limit | 5 hops | `MAX_REDIRECTS` |
-| Total PIDs | 20 (4 derived) | `ALL_PIDS` |
-| Concurrent async tasks | 7 | `asyncio.gather()` |
+| Total PIDs | 24 (2 derived) | `ALL_PIDS` |
+| Concurrent async tasks | 3 | `asyncio.gather()` |
+| Wake modes | timer / reed / both / none | `WAKE_MODE` |
 
 ---
 
 *Generated for XC90 OBD Logger Firmware v0.1.0 — ESP32-S3 / MicroPython v1.28.0*
+
+**See also:** [POWER_MANAGEMENT.md](./POWER_MANAGEMENT.md) — Deep sleep & wake strategy details
+[SCHEMA.md](./SCHEMA.md) — CSV column schema evolution guide

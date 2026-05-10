@@ -8,12 +8,13 @@ Logs engine data via BLE ELM327 adapter → Google Sheets in real time.
 
 ```
 xc90_logger/
-├── config.py              # WiFi, BLE, sampling, storage settings
+├── config.py              # WiFi, BLE, sampling, sleep/wake settings
 ├── decoder.py             # ELM327 response decoder + derived calculations
-├── logger.py              # Trip detection, CSV builder, flash storage
-├── main.py                # Async orchestrator — single sequential sampler
-├── obd.py                 # BLE driver + ELM327 protocol handler
-├── pids.py                # OBD-II PID definitions (18 Mode 01 PIDs)
+├── logger.py              # Trip detection, CSV builder, flash storage, PreStartBuffer
+├── main.py                # Async orchestrator — single sequential sampler + deep sleep
+├── obd.py                 # BLE driver + ELM327 protocol handler + quick BLE scan
+├── pids.py                # OBD-II PID definitions (22 Mode 01 PIDs)
+├── power_manager.py       # Deep sleep & dual wake (timer / reed GPIO)
 ├── uploader.py            # WiFi + Google Sheets webhook uploader
 ├── README.md              # This file
 ├── .gitignore
@@ -73,3 +74,14 @@ XC90 ECU → iCar Pro BLE → ESP32 → CSV on flash → WiFi → Google Sheets
 
 37 columns, one dense row per second. All columns forward-filled for AI readiness.
 See `docs/SCHEMA.md` for column details and evolution rules.
+
+## Power Management
+
+The ESP32-S3 enters deep sleep after 30 minutes of engine-off, drawing <0.1 mA.
+Configurable wake modes:
+- **Timer** — RTC wake every 5 min + quick BLE scan ($0 hardware)
+- **Reed switch** — GPIO wake on door open ($1 hardware, instant)
+- **Both** — Reed primary + timer fallback
+- **None** — Always-on 24/7
+
+See `docs/POWER_MANAGEMENT.md` for full details, wiring diagrams, and battery calculations.

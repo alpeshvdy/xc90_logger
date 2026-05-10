@@ -9,6 +9,8 @@ from micropython import const
 from config import (
     BLE_CONNECT_TIMEOUT,
     BLE_RETRY_LIMIT,
+    ICAR_DEVICE_NAME_IOS,
+    ICAR_DEVICE_NAME_ANDROID,
     ICAR_SERVICE_UUID,
     ICAR_WRITE_CHAR_UUID,
     ICAR_NOTIFY_CHAR_UUID,
@@ -211,6 +213,107 @@ class OBDClient:
             print(f"[obd] Connected: {addr_str}")
             return True
         return False
+
+    # --------------------------------------------------------
+    # QUICK SCAN — fast BLE presence check (no connection)
+    # --------------------------------------------------------
+
+    def quick_scan(self, scan_time=3):
+        """
+        Fast BLE scan to check if the iCar Pro is advertising.
+        Used by PowerManager on timer wake — if iCar is visible,
+        the car was just started. If not, go back to sleep.
+
+        Scans for:
+          - Device name matching ICAR_DEVICE_NAME_IOS / ANDROID
+          - 16-bit service UUIDs matching OBD_SCAN_SERVICE_UUIDS
+
+        Returns True on first match, False if nothing found.
+        No connection is made — advertisement parsing only.
+        """
+        _IRQ_SCAN_RESULT = const(5)
+        _IRQ_SCAN_DONE = const(6)
+        found = False
+        scan_done = False
+
+        def _quick_cb(event, data):
+            nonlocal found, scan_done
+            if found or scan_done:
+                return
+            if event == _IRQ_SCAN_RESULT:
+                addr_type, addr, adv_type, rssi, adv_data = data
+                if not adv_data:
+                    return
+                # Check device name in AD
+                name = self._parse_name_from_ad(adv_data)
+                if name:
+                    if name in (ICAR_DEVICE_NAME_IOS, ICAR_DEVICE_NAME_ANDROID):
+                        found = True
+                        return
+                # Check 16-bit service UUIDs
+                uuid16 = self._parse_uuid16_from_ad(adv_data)
+                if uuid16 and uuid16 in OBD_SCAN_SERVICE_UUIDS:
+                    found = True
+            elif event == _IRQ_SCAN_DONE:
+                scan_done = True
+
+        # Install temporary scan callback
+        self._ble.irq(_quick_cb)
+        try:
+            # Active scan: 30ms interval, 30ms window (fast)
+            self._ble.gap_scan(
+                scan_time * 1000,
+                int(30000),
+                int(30000),
+            )
+            # Wait for scan to finish
+            deadline = time.time() + scan_time + 2
+            while not scan_done and time.time() < deadline:
+                time.sleep_ms(50)
+                if found:
+                    break
+        finally:
+            # Stop scan and restore IRQ
+            try:
+                self._ble.gap_scan(None)
+            except Exception:
+                pass
+            self._ble.irq(self._irq_handler)
+
+        return found
+
+    @staticmethod
+    def _parse_name_from_ad(adv_data):
+        """Extract complete or short local name from AD data."""
+        i = 0
+        while i < len(adv_data):
+            length = adv_data[i]
+            if length == 0 or i + length >= len(adv_data):
+                break
+            ad_type = adv_data[i + 1]
+            payload = adv_data[i + 2:i + 1 + length]
+            if ad_type in (0x08, 0x09):  # Short / Complete Local Name
+                try:
+                    return payload.decode("utf-8").rstrip("\x00")
+                except Exception:
+                    return None
+            i += 1 + length
+        return None
+
+    @staticmethod
+    def _parse_uuid16_from_ad(adv_data):
+        """Extract first 16-bit UUID from AD data."""
+        i = 0
+        while i < len(adv_data):
+            length = adv_data[i]
+            if length == 0 or i + length >= len(adv_data):
+                break
+            ad_type = adv_data[i + 1]
+            payload = adv_data[i + 2:i + 1 + length]
+            if ad_type in (0x02, 0x03) and len(payload) >= 2:
+                return int.from_bytes(payload[:2], "little")
+            i += 1 + length
+        return None
 
     # --------------------------------------------------------
     # TIER 1 — SERVICE UUID SCAN

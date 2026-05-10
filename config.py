@@ -59,6 +59,77 @@ TRIP_END_DELAY = 10         # seconds RPM must stay at 0 before trip ends
                             # prevents false trip end at traffic lights
 IDLE_POLL_INTERVAL = 5000   # ms between polls when engine is off
 
+# ============================================================
+# --- Sleep / Wake ---
+# ============================================================
+
+# Wake mode — how the ESP32 wakes from deep sleep:
+#
+#   "timer"   RTC timer only — wakes every SLEEP_WAKE_INTERVAL_MS,
+#             does a 3s BLE scan for iCar Pro, goes back to sleep
+#             if car is off. Zero hardware needed.
+#             Idle draw: ~15.5 mAh/day (288 wasted wake cycles/day)
+#
+#   "reed"    GPIO ext0 wake from reed switch on car door.
+#             ESP32 sleeps forever until door opens. Instant wake,
+#             zero wasted cycles. Requires $1 reed switch + magnet.
+#             Idle draw: ~0.98 mAh/day
+#
+#   "both"    Timer fallback + GPIO instant wake.
+#             Reed switch is primary (door open → instant).
+#             Timer is backup (catches engine start within 5 min
+#             even if reed switch fails). Best of both worlds.
+#             Idle draw: ~1.0 mAh/day (timer fires but rarely
+#             finds iCar if reed already triggered full boot)
+#
+#   "none"    Never sleep. Always-on 24/7 mode (~1355 mAh/day).
+#             Not recommended for parked cars.
+#
+WAKE_MODE = "timer"  # Start with timer-only, no hardware needed
+
+# After engine has been off this long, enter deep sleep to save battery.
+# The ESP32-S3 draws ~80mA active but <0.1mA in deep sleep.
+# Set to 0 to disable sleep entirely (always-on 24/7 mode).
+SLEEP_AFTER_IDLE_MS = 30 * 60 * 1000  # 30 minutes of 0 RPM
+
+# When in deep sleep (timer mode), wake every this many ms to check
+# if the car has started. Lower = catches engine start faster,
+# higher = saves battery.
+# 5 minutes: ~288 wakeups per 24h, ~15.3 mAh/day.
+SLEEP_WAKE_INTERVAL_MS = 5 * 60 * 1000  # check every 5 minutes
+
+# Quick BLE scan timeout when waking from timer — how long to look
+# for the iCar Pro before giving up and going back to sleep.
+# 3 seconds is enough for a BLE advertisement to come through.
+WAKE_BLE_SCAN_TIMEOUT = 3  # seconds (was SLEEP_WAKE_BLE_TIMEOUT)
+
+# --- Reed Switch GPIO (only used when WAKE_MODE includes "reed") ---
+
+# GPIO pin connected to the reed switch.
+# Must be an RTC-capable GPIO (0-21 on ESP32-S3).
+# GPIO4 is available and RTC-safe.
+#
+# Wiring:
+#   3.3V ── 100kΩ ──┬── GPIO4 (RTC wake)
+#                    │
+#              Reed Switch (NO)
+#                    │
+#                   GND
+#
+# Door CLOSED: magnet near reed → switch closed → GPIO = LOW
+# Door OPENS:  magnet away     → switch opens  → GPIO pulled HIGH → WAKE
+#
+REED_GPIO_PIN = 4
+
+# Active level for reed switch wake-on-ext0.
+# 1 = wake when GPIO goes HIGH (door opens, switch opens, pull-up pulls high)
+# 0 = wake when GPIO goes LOW  (door closes)
+REED_WAKE_LEVEL = 1
+
+# Number of engine-off rows to keep in RAM buffer before engine start.
+# These get flushed on engine start so you capture the transition.
+PRE_START_BUFFER_ROWS = 12  # ~60 seconds at 5s polling
+
 
 # Storage
 LOG_DIR = "./logs"                   # directory on LOLIN flash
