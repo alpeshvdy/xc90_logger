@@ -274,3 +274,155 @@ The boot cause is stored in RTC memory (survives deep sleep). On wake, `detect_b
 | I want the best of both | `"both"` |
 | My car is on a battery tender | `"none"` (always-on) |
 | I park for weeks at a time | `"reed"` + unplug iCar Pro |
+
+---
+
+## Appendix: OBD Power Wiring — ESP32 + iCar Pro from One Port
+
+The OBD-II port provides constant 12V on pin 16 (unswitched) and ground on pins 4/5. Both devices can be powered from the same port using a Y-splitter.
+
+### Option A — Y-Splitter with Inline Buck Converter ($12 total)
+
+```
+OBD Port (female)
+  │
+  ├─── OBD Y-Splitter (1 male → 2 female) ──┬─── iCar Pro (12V direct)
+  │                                          │
+  │                                          └─── 12V → Buck Converter (12V→5V)
+  │                                                      │
+  │                                                      └─── LOLIN S3 USB-C (5V)
+```
+
+| Part | Cost | Notes |
+|------|------|-------|
+| OBD-II Y-splitter cable | $8 | 1 male to 2 female, 10-15cm long |
+| Mini360 buck converter (12V→5V, 2A) | $1 | Screw terminal preferred |
+| USB-A to USB-C cable (old charger cable) | $0 | Cut and splice, or use USB-C breakout |
+
+**Assembly:**
+1. Plug Y-splitter into OBD port
+2. iCar Pro plugs into one female port (it handles its own 12V regulation)
+3. Cut a USB-A cable, strip the 5V/GND wires, connect to buck converter output
+4. Or use a USB-C breakout board soldered to buck converter output
+5. Add a **1A inline fuse** on the 12V line going to the buck converter for safety
+
+### Option B — Bare Pigtail + Two Buck Converters ($10 total)
+
+```
+OBD Port pin 16 (12V) ──┬── Buck #1 → iCar Pro
+                        │
+                        └── Buck #2 → LOLIN S3 (5V USB-C)
+
+OBD Port pin 4/5 (GND) ──┴── Both buck converters GND
+```
+
+| Part | Cost | Notes |
+|------|------|-------|
+| OBD-II pigtail (bare wires) | $3 | Amazon: "OBD2 connector pigtail 16-pin" |
+| 2× Mini360 buck converter | $2 | One per device |
+| USB-C breakout or cut USB cable | $0 | For ESP32 |
+| 2× 1A fuse (inline blade holder) | $1 | One per circuit |
+
+**Wire colors (standard OBD-II pigtail):**
+| Pin | Function | Typical Wire Color |
+|-----|----------|-------------------|
+| 16 | 12V constant (unswitched) | Red or Yellow |
+| 4 | Chassis ground | Black |
+| 5 | Signal ground | Black/White |
+
+### Option C — Hardwire Kit (with Low-Voltage Cutoff) ($15)
+
+For permanent installation with battery protection:
+
+```
+Fuse box (ACC or always-on fuse) ──→ Hardwire kit ──→ 12V→5V buck ──→ ESP32
+                                         │
+                                         └── Low-voltage cutoff (cuts at 11.8V)
+```
+
+Hardwire kits (e.g., for dash cams) include an inline fuse and a low-voltage cutoff that protects your car battery from draining below ~12V. Connect the ESP32 to the kit's USB output.
+
+### GPIO Pin Reference for Reed Switch (LOLIN S3)
+
+| LOLIN S3 Pin | GPIO | Notes |
+|-------------|------|-------|
+| GPIO4 | RTC (wake-capable) | Used for reed switch ext0 wake |
+| 3.3V | — | Pull-up resistor supply |
+| GND | — | Reed switch ground |
+| EN | — | Press to hard reset (useful during testing) |
+
+### Full Wiring Diagram — Reed Switch + ESP32 + iCar Pro
+
+```
+                    OBD PORT (under dash)
+                    ╔══════════════════════╗
+                 16 │  ●  12V always-on    │  ← Red/Yellow wire
+                  4 │  ●  GND (chassis)    │  ← Black wire
+                  5 │  ●  GND (signal)     │  ← Black/White wire
+                    ╚══════════════════════╝
+                          │
+          ┌───────────────┴───────────────┐
+          │                               │
+    ┌─────▼─────┐                  ┌─────▼─────┐
+    │  iCar Pro │                  │ Y-Splitter│
+    │  (BLE)    │                  │           │
+    └─────┬─────┘                  │     ┌─────┼─────┐
+          │                         │     │          │
+          │                         │  Port A    Port B
+    No power regulation            │  (iCar)  (Buck→ESP32)
+    inside iCar Pro (12V in)       │           │
+          │                         │      ┌────▼────┐
+          │                         │      │ Buck    │
+          │                         │      │ 12V→5V  │
+          │                         │      └───┬────┘
+          │                         │          │ 5V
+          │                         │     ┌────▼────┐
+          │                         │     │ LOLIN S3│
+          │                         │     └────┬────┘
+          │                         │          │
+          │                         │     ┌────▼────┐
+          │                         │     │ GPIO4   │
+          │                         │     │   │     │
+          │                         │     │ 100kΩ   │
+          │                         │     │   │     │
+          │                         │     │ REED    │
+          │                         │     │ SWITCH  │
+          │                         │     │   │     │
+          │                         │     └────┼────┘
+          │                         │          │ GND
+          │                         └──────────┘
+          │
+      iCar Pro BLE
+      ↕ (connected to ESP32 via BLE)
+
+    REED SWITCH INSTALLATION:
+    ┌─────────────────────────────────────────┐
+    │  DOOR FRAME (B-pillar)                   │
+    │                                          │
+    │  ┌─────────┐        ┌─────────┐         │
+    │  │ REED    │  ←5mm→ │ MAGNET  │         │
+    │  │ SWITCH  │        │ (tape)  │         │
+    │  │ (tape)  │        │         │         │
+    │  └────┬────┘        └─────────┘         │
+    │       │                                  │
+    │    GPIO4 (via 100kΩ)                    │
+    │       │                                  │
+    │    GND                                   │
+    │                                          │
+    │  DOOR (opens → magnet moves away →       │
+    │       reed opens → GPIO4 HIGH → WAKE)   │
+    └─────────────────────────────────────────┘
+```
+
+### Parts List Summary
+
+| Component | Quantity | Cost |
+|-----------|----------|------|
+| OBD-II Y-splitter cable | 1 | $8 |
+| Mini360 buck converter (12V→5V) | 1–2 | $1–2 |
+| 100kΩ resistor (0805 or through-hole) | 1 | $0.05 |
+| Reed switch (NO, e.g. SW-420 or equivalent) | 1 | $2 |
+| Small neodymium magnet (钕磁铁) | 1 | $1 |
+| 1A inline blade fuse + holder | 1 | $1 |
+| USB-C breakout or cut USB cable | 1 | $0 |
+| **Total** | | **~$13–15** |
