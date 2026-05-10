@@ -35,8 +35,9 @@ TJA1145 INH (open-drain) ──────────→ Buck EN pin
                                         │
                                     10kΩ pull-down to GND (prevents accidental enable on startup)
 
-TJA1145 TXD ─────────────────────────→ ESP32 GPIO1 (TWAI TX)
-TJA1145 RXD ─────────────────────────→ ESP32 GPIO2 (TWAI RX)
+TJA1145 TXD ─────────────────────────→ ESP32 GPIO1 (TWAI TX)  ← optional, for future CAN monitoring
+TJA1145 RXD ─────────────────────────→ ESP32 GPIO2 (TWAI RX)  ← not required for current wake-only architecture
+                                              (iCar Pro handles all OBD data over BLE — no TWAI needed today)
 
 TJA1145 STBY ────────────────────────→ ESP32 GPIO6 (drive HIGH = normal mode)
 TJA1145 INT ─────────────────────────→ ESP32 GPIO5 (optional, diagnostics only)
