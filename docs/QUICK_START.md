@@ -104,7 +104,7 @@ You'll see:
 [obd] Found device: ANDROID-VLINK
 [obd] Connecting...
 [obd] Connected successfully
-[sampler:critical] Started — interval 1.0s
+[sampler] Sequential sampler started — 1 row/1s
 ...
 ```
 
@@ -153,17 +153,14 @@ Press Ctrl+C to exit. Output will show:
 ```
 ESP32 Project Structure:
 ├── config.py          - WiFi, webhook, sampling config
-├── pids.py            - OBD PID definitions (37 PIDs)
-├── decoder.py         - OBD response parser (53 tests)
-├── logger.py          - Trip & CSV logging (42 tests)
+├── pids.py            - OBD PID definitions (18 PIDs)
+├── decoder.py         - OBD response parser
+├── logger.py          - Trip & CSV logging
 ├── obd.py             - BLE/iCar Pro driver
-├── uploader.py        - WiFi & Google Sheets (33 tests)
-├── main.py            - Async orchestrator
+├── uploader.py        - WiFi & Google Sheets uploader
+├── main.py            - Async orchestrator (3 tasks)
 ├── boot_test.py       - Pre-flight validation
-├── test_webhook.py    - Webhook tester (local only)
-└── wokwi_test.py      - Simulator test (Wokwi)
-
-All code tested: 128/128 tests passing ✅
+└── test_webhook.py    - Webhook tester (local only)
 ```
 
 ---
@@ -173,14 +170,13 @@ All code tested: 128/128 tests passing ✅
 1. **Storage Init** - Creates /logs directory
 2. **Component Init** - OBD, Logger, Uploader
 3. **BLE Connect** - Finds and connects to iCar Pro
-4. **Sampling Start** - 4 concurrent async tasks:
-   - Critical (1s) - RPM, speed, coolant
-   - Standard (2s) - Fuel trims, MAF, throttle
-   - Slow (5s) - Oil temp, battery
-   - Enhanced (10s) - Boost, turbo data
-5. **Trip Monitor** - Watches for RPM > 100 to start
-6. **Upload Task** - Attempts WiFi every 5 min
-7. **Connection Monitor** - Detects BLE drops
+4. **Sampling Start** - Single sequential sampler (Torque Pro method):
+   - Critical PIDs every cycle (1s)
+   - Standard PIDs every 2nd cycle (2s)
+   - Slow PIDs every 5th cycle (5s)
+   - Trip detection runs inline each cycle
+5. **Upload Task** - Attempts WiFi every 5 min
+6. **Connection Monitor** - Detects BLE drops, auto-reconnects
 
 ---
 

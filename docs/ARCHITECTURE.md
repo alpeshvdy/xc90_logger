@@ -42,13 +42,15 @@
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-**Purpose:** Log 20+ OBD-II/Enhanced PIDs from the XC90's ECU continuously, buffer to flash, and auto-upload to Google Sheets when WiFi is available.
+**Purpose:** Log 18 Mode 01 OBD-II PIDs from the XC90's ECU continuously, buffer to flash, and auto-upload to Google Sheets when WiFi is available.
 
 **Key design decisions:**
-- **Async concurrency** — 7 `uasyncio` tasks run simultaneously (4 samplers + trip monitor + upload + connection watchdog)
+- **Async concurrency** — 3 `uasyncio` tasks run simultaneously (sampler_sequential + upload + connection watchdog)
+- **Single sequential sampler** — Torque Pro method: queries all PIDs in sequence, one dense row per cycle
 - **RAM buffer** — 50 rows buffered before flash write (reduces flash wear)
 - **Three-tier BLE discovery** — works with any ELM327 BLE adapter, not just iCar Pro
 - **Offline-first** — logs locally even without WiFi; uploads next time you're home
+- **Forward-filling** — SensorState keeps latest value for every PID, ensuring every CSV column is populated every row
 
 ---
 
@@ -87,24 +89,20 @@
             └────────┬─────────┘
                      │
                      ▼ (connected)
-            ┌──────────────────┐
-            │ PID Probe        │  First boot only — test enhanced PIDs
-            │ (engine running) │  Saves → /logs/pid_probe.json
-            └────────┬─────────┘
-                     │
-                     ▼
      ┌───────────────┴───────────────────────────────────────┐
-     │              LAUNCH 7 ASYNC TASKS                      │
+     │              LAUNCH 3 ASYNC TASKS                      │
      │                                                        │
-     │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ │
-     │  │ Critical │ │ Standard │ │  Slow    │ │ Enhanced │ │
-     │  │ Sampler  │ │ Sampler  │ │ Sampler  │ │ Sampler  │ │
-     │  │  (1s)    │ │  (2s)    │ │  (5s)    │ │ (10s)    │ │
-     │  └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ │
-     │       │            │            │            │        │
-     │       └────────────┴────────────┴────────────┘        │
-     │                         │                              │
-     │                         ▼                              │
+     │  ┌──────────────────────────────────────────────────┐ │
+     │  │           Sequential Sampler                      │ │
+     │  │                                                  │ │
+     │  │  One cycle = 1 dense row per second:             │ │
+     │  │  • Query critical PIDs (every cycle)              │ │
+     │  │  • Query standard PIDs (every 2nd cycle)          │ │
+     │  │  • Query slow PIDs (every 5th cycle)              │ │
+     │  │  • Build ONE dense row with forward-filled values │ │
+     │  └─────────────────────┬────────────────────────────┘ │
+     │                        │                              │
+     │                        ▼                              │
      │              ┌──────────────────┐                      │
      │              │  SensorState     │   Shared dict        │
      │              │  (shared cache)  │   of latest values   │
@@ -113,9 +111,9 @@
      │         ┌─────────────┼─────────────┐                  │
      │         ▼             ▼             ▼                  │
      │  ┌──────────┐  ┌──────────┐  ┌──────────┐             │
-     │  │ Trip     │  │ build_row│  │ Dispatch │             │
-     │  │ Monitor  │  │ (CSV row)│  │ to Tier  │             │
-     │  │ (1s)     │  └────┬─────┘  └──────────┘             │
+     │  │ Trip     │  │ build_row│  │ Derived  │             │
+     │  │ Detection │  │ (CSV row)│  │ PIDs     │             │
+     │  │ (inline)  │  └────┬─────┘  └──────────┘             │
      │  └────┬─────┘       │                                   │
      │       │             ▼                                   │
      │       │      ┌────────────┐                             │
@@ -164,8 +162,8 @@
 │                          main.py                                 │
 │                    (Orchestrator / Entry Point)                   │
 │                                                                  │
-│  boot() → init all modules → BLE connect → PID probe → tasks    │
-│  main() → boot() → launch 7 async tasks → asyncio.gather()      │
+│  boot() → init all modules → BLE connect → tasks    │
+│  main() → boot() → launch 3 async tasks → asyncio.gather()      │
 └───────┬──────┬────────┬──────────┬──────────┬───────────────────┘
         │      │        │          │          │
         ▼      ▼        ▼          ▼          ▼
@@ -196,12 +194,12 @@
 | Module | Role | Key Classes/Functions |
 |--------|------|----------------------|
 | **`config.py`** | All configuration constants | WiFi, BLE, sampling rates, storage limits |
-| **`pids.py`** | PID definitions (20 PIDs in 4 tiers) | `CRITICAL_PIDS`, `STANDARD_PIDS`, `SLOW_PIDS`, `ENHANCED_PIDS`, `PIDS_BY_TIER` |
+| **`pids.py`** | PID definitions (18 PIDs in 3 tiers) | `CRITICAL_PIDS`, `STANDARD_PIDS`, `SLOW_PIDS`, `PIDS_BY_TIER` |
 | **`decoder.py`** | Raw ELM327 → decoded value pipeline | `decode()`, `clean_response()`, `extract_bytes()`, `validate_range()` |
 | **`obd.py`** | BLE connection + ELM327 protocol | `OBDClient` class: `connect()`, `query()`, `_scan_for_obd_by_service()` |
 | **`logger.py`** | Trip detection + CSV logging | `TripManager`, `LogBuffer`, `build_row()`, `classify_engine_state()` |
 | **`uploader.py`** | WiFi + Google Sheets HTTPS upload | `WiFiManager`, `upload_pending()`, `_http_post_json()` |
-| **`main.py`** | Async orchestrator | `boot()`, `main()`, `sampler_task()`, 7 concurrent `uasyncio` tasks |
+| **`main.py`** | Async orchestrator | `boot()`, `main()`, `sampler_sequential()`, 3 concurrent `uasyncio` tasks |
 
 ---
 
@@ -236,8 +234,8 @@
 │  4. build_row(trip_manager, sensor_state.get_all(), ...)             │
 │     ├── classify_engine_state(coolant) → cold_start/warming/normal/hot │
 │     ├── classify_drive_phase(rpm, throttle, speed) → idle/light/...  │
-│     ├── calculate_derived()            → fuel_trim_sum, boost_delta  │
-│     └── Assemble 31-column CSV row dict                              │
+│     ├── calculate_derived()            → fuel_trim_sum, iat_ambient_delta_c │
+│     └── Assemble 37-column CSV row dict                              │
 │                                                                      │
 │  5. log_buffer.add(row)                                              │
 │     └── Append to RAM buffer; flush to flash when ≥ 50 rows          │
@@ -333,15 +331,11 @@ main.py:main()
         ├── 7. Wait for upload to finish (upload_done.wait())
         │     (WiFi radio safety — don't collide with BLE)
         │
-        ├── 8. If first boot: run_pid_probe()  obd.py
-        │     └── Test all enhanced PIDs against ECU
-        │         Save results → /logs/pid_probe.json
-        │
-        └── 9. Return (obd, trip_manager, log_buffer, sensor_state, wifi_manager)
+        └── 8. Return (obd, trip_manager, log_buffer, sensor_state, wifi_manager)
 
 main.py:main() continues:
   │
-  ├── Launch 7 concurrent async tasks
+  ├── Launch 3 concurrent async tasks
   │
   └── await asyncio.gather(*tasks)
         │
@@ -352,66 +346,68 @@ main.py:main() continues:
 
 ## 6. Sampling System
 
-### 6.1 Four Tiers
+### 6.1 Three Tiers — Single Sequential Sampler
+
+The firmware uses a **single sequential sampler** (Torque Pro method) instead of multiple concurrent sampler tasks. One loop queries all PIDs in sequence at `ROW_INTERVAL_MS`, producing one dense row per cycle.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  TIER         │ INTERVAL │ PIDs                                │
-├───────────────┼──────────┼─────────────────────────────────────┤
-│  critical     │   1s     │ rpm, coolant_temp_c, boost_actual,  │
-│               │          │ vehicle_speed_kph                    │
-├───────────────┼──────────┼─────────────────────────────────────┤
-│  standard     │   2s     │ engine_load_pct, throttle_pos_pct,  │
-│               │          │ stft_pct, ltft_pct, maf_g_s,        │
-│               │          │ intake_air_temp_c                    │
-├───────────────┼──────────┼─────────────────────────────────────┤
-│  slow         │   5s     │ oil_temp_c, battery_voltage_v,      │
-│               │          │ baro_pressure_kpa, fuel_trim_sum*   │
-├───────────────┼──────────┼─────────────────────────────────────┤
-│  enhanced     │  10s     │ boost_target_kpa, boost_delta_kpa*, │
-│               │          │ turbo_inlet_pres, oil_pressure_kpa  │
-│               │          │                                     │
-│               │          │ * = derived (calculated, not OBD)   │
-└───────────────┴──────────┴─────────────────────────────────────┘
+│  TIER         │ INTERVAL │ QUERY FREQUENCY    │ PIDs            │
+├───────────────┼──────────┼────────────────────┼─────────────────┤
+│  critical     │   1s     │ Every cycle        │ rpm, coolant,   │
+│               │          │                    │ boost_actual,   │
+│               │          │                    │ vehicle_speed   │
+├───────────────┼──────────┼────────────────────┼─────────────────┤
+│  standard     │   2s     │ Every 2nd cycle    │ engine_load,    │
+│               │          │                    │ throttle, stft, │
+│               │          │                    │ ltft, maf, iat, │
+│               │          │                    │ timing, fuel_sys│
+│               │          │                    │ o2_lambda,      │
+│               │          │                    │ absolute_load   │
+├───────────────┼──────────┼────────────────────┼─────────────────┤
+│  slow         │   5s     │ Every 5th cycle    │ oil_temp,       │
+│               │          │                    │ battery, baro,  │
+│               │          │                    │ fuel_pressure,  │
+│               │          │                    │ ambient_temp,   │
+│               │          │                    │ engine_run_time,│
+│               │          │                    │ dtc_count,      │
+│               │          │                    │ fuel_rate,      │
+│               │          │                    │ fuel_trim_sum*, │
+│               │          │                    │ iat_ambient_delta_c*│
+│               │          │                    │                 │
+│               │          │                    │ * = derived      │
+└───────────────┴──────────┴────────────────────┴─────────────────┘
 ```
 
-### 6.2 Sampler Task Logic
+### 6.2 Sampler Task Logic (Sequential)
 
 ```
-sampler_task(obd, trip_manager, log_buffer, sensor_state, tier):
-  │
-  ├── Get PIDs and interval for this tier
+sampler_sequential(obd, trip_manager, log_buffer, sensor_state):
   │
   └── while True:
         │
-        ├── If not trip_active AND tier != "critical":
-        │     sleep(IDLE_POLL_INTERVAL)  ← 5s poll when engine off
-        │     continue
+        ├── If NOT trip_active (engine off):
+        │     ├── Query RPM only (to detect trip start)
+        │     ├── Run trip detection
+        │     └── sleep(IDLE_POLL_INTERVAL)  ← 5s poll
         │
-        ├── If not obd.is_connected():
-        │     sleep(1)
-        │     continue
+        ├── Query CRITICAL PIDs (every cycle)
+        │     └── sensor_state.update() for each
         │
-        ├── for each pid_name, pid_def in tier's PIDs:
-        │     │
-        │     ├── Skip derived PIDs (cmd is None)
-        │     │
-        │     ├── result = obd.query(pid_name)
-        │     │     │
-        │     │     └── Switch enhanced/standard CAN mode as needed
-        │     │
-        │     ├── sensor_state.update(pid_name, result)
-        │     │
-        │     ├── row = build_row(
-        │     │       trip_manager,
-        │     │       sensor_state.get_all(),  ← ALL tiers' latest values
-        │     │       tier, pid_def["cmd"],
-        │     │       result["raw"], result["status"]
-        │     │     )
-        │     │
+        ├── Query STANDARD PIDs (every 2nd cycle)
+        │     └── sensor_state.update() for each
+        │
+        ├── Query SLOW PIDs (every 5th cycle)
+        │     └── sensor_state.update() for each (skip derived)
+        │
+        ├── Run trip detection (rpm, speed)
+        │     └── If trip just ended → flush buffer
+        │
+        ├── If trip active:
+        │     ├── build_row(sensor_state.get_all())  ← ALL forward-filled values
         │     └── log_buffer.add(row)
         │
-        └── sleep(interval)
+        └── sleep(max(0, row_interval - elapsed))
 ```
 
 ### 6.3 SensorState — Shared Value Cache
@@ -428,14 +424,19 @@ sampler_task(obd, trip_manager, log_buffer, sensor_state, tier):
     standard ──────►│  stft_pct: -2.3     │
     standard ──────►│  ltft_pct: 3.1      │
     standard ──────►│  maf_g_s: 42.5      │
+    standard ──────►│  timing_adv: 12.0   │
+    standard ──────►│  fuel_sys: 2        │
+    standard ──────►│  o2_lambda: 0.999   │
+    standard ──────►│  absolute_load: 45  │
     ...              │  ...               │
     slow ──────────►│  oil_temp_c: 98     │
     slow ──────────►│  battery: 14.1      │
     slow ──────────►│  baro: 101          │
-    ...              │  ...               │
-    enhanced ──────►│  boost_target: 120  │
-    enhanced ──────►│  turbo_inlet: 100   │
-    enhanced ──────►│  oil_pressure: 340  │
+    slow ──────────►│  fuel_pressure: 350 │
+    slow ──────────►│  ambient_temp: 22   │
+    slow ──────────►│  engine_run_time:   │
+    slow ──────────►│  dtc_count: 0       │
+    slow ──────────►│  fuel_rate: 2.5     │
                     │                     │
                     │  get_all() → dict   │──► build_row() includes ALL values
                     │  get("rpm") → 1726  │     in every row, even if some tiers
@@ -659,40 +660,35 @@ _http_post_json(url, body):
 ```
 xc90_logger/
 │
-├── main.py              Orchestrator — boot sequence, 7 async tasks
+├── main.py              Orchestrator — boot sequence, 3 async tasks
 ├── config.py            All constants (WiFi, BLE, sampling, storage)
-├── pids.py              PID definitions (20 PIDs across 4 tiers)
+├── pids.py              PID definitions (18 PIDs across 3 tiers)
 ├── decoder.py           ELM327 raw response → decoded value pipeline
 ├── obd.py               BLE client — 3-tier discovery, AT init, PID query
 ├── logger.py            Trip detection, CSV row building, flash buffer
 ├── uploader.py          WiFi manager, HTTPS POST, cleanup, health checks
 │
-├── code.gs              Google Apps Script — webhook receiver
+├── deploy/
+│   └── code.gs          Google Apps Script — webhook receiver
 │
-├── tests/
-│   ├── __init__.py
-│   ├── mocks.py         Test mocks for MicroPython modules
-│   ├── test_decoder.py  Decoder unit tests
-│   ├── test_logger.py   Logger unit tests
-│   └── test_uploader.py Uploader unit tests
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── SCHEMA.md
+│   ├── DEPLOYMENT_GUIDE.md
+│   ├── QUICK_START.md
+│   ├── WEBHOOK_SETUP.md
+│   └── FIRST_TEST.md
 │
 ├── tools/
 │   ├── fix_com_port.py           COM port diagnostic
-│   └── troubleshoot_connection.py Connection debugger
+│   ├── troubleshoot_connection.py Connection debugger
+│   ├── test_webhook.py           Webhook tester
+│   ├── boot_test.py              Pre-flight validation
+│   ├── ble_scan_debug.py         BLE advertisement scanner
+│   └── first_try.py              Early BLE exploration
 │
-├── ESP32-S3-WROOM-1_REFERENCE.md  Hardware reference (pin map, power, BLE specs)
-├── ARCHITECTURE.md                ← THIS FILE
-├── DEPLOYMENT_GUIDE.md            Step-by-step flashing + deploy
-├── QUICK_START.md                 Fast deploy for LOLIN Pro
-├── WEBHOOK_SETUP.md               Google Sheets Apps Script setup
-├── PID_VALIDATION_GUIDE.md        How to validate enhanced PIDs
-├── FIRST_TEST.md                  First test instructions
-│
-├── diagram.json          Wokwi simulator diagram
-├── wokwi.toml            Wokwi config
-├── wokwi_test.py         Simulator test script
-│
-└── xc90_001.csv          Sample captured log data
+└── hw/
+    └── ESP32-S3-WROOM-1_REFERENCE.md  Hardware reference
 ```
 
 ### Dependency Graph
@@ -725,12 +721,10 @@ xc90_logger/
 
 ## Quick Reference: Key Numbers
 
-| Parameter | Value | Config Key |
-|-----------|-------|-----------|
+| Row output interval | 1s | `ROW_INTERVAL_MS` |
 | Critical sample rate | 1s | `SAMPLE_RATE_CRITICAL` |
 | Standard sample rate | 2s | `SAMPLE_RATE_STANDARD` |
 | Slow sample rate | 5s | `SAMPLE_RATE_SLOW` |
-| Enhanced sample rate | 10s | `SAMPLE_RATE_ENHANCED` |
 | RAM buffer flush | 50 rows | `BUFFER_SIZE` |
 | Max log file size | 512 KB | `MAX_LOG_SIZE_KB` |
 | Trip start threshold | RPM ≥ 100 | `TRIP_START_RPM` |
@@ -741,8 +735,8 @@ xc90_logger/
 | BLE probe per device | 5 seconds | `BLE_PROBE_PER_DEVICE_TIMEOUT` |
 | WiFi timeout | 10 seconds | `WIFI_TIMEOUT` |
 | HTTPS redirect limit | 5 hops | `MAX_REDIRECTS` |
-| Total PIDs | 20 (4 derived) | `ALL_PIDS` |
-| Concurrent async tasks | 7 | `asyncio.gather()` |
+| Total PIDs | 18 (2 derived) | `ALL_PIDS` |
+| Concurrent async tasks | 3 | `asyncio.gather()` |
 
 ---
 

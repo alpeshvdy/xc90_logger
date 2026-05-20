@@ -7,7 +7,7 @@ The XC90 Logger has **three places** that must agree on column schema:
 | Location | File | Role |
 |----------|------|------|
 | **ESP32 firmware** | `logger.py` → `CSV_COLUMNS` | Defines what columns are written to flash CSV |
-| **Google Sheets** | `code.gs` → `CSV_HEADERS` | Defines what columns the webhook accepts |
+| **Google Sheets** | `deploy/code.gs` → `CSV_HEADERS` | Defines what columns the webhook accepts |
 | **Google Sheets tab** | Row 1 of `XC90_Logs` | Live data — header row overwritten on every POST |
 
 **Rule**: All three must be identical. If they drift, columns get silently dropped or misaligned.
@@ -73,7 +73,7 @@ The XC90 Logger has **three places** that must agree on column schema:
 
 ### Step 1: Decide what you're adding
 
-- **New OBD PID**: Add to `pids.py` in the appropriate tier, then add column to CSV_COLUMNS.
+- **New OBD PID**: Add to `pids.py` in the appropriate tier (critical/standard/slow), then add column to CSV_COLUMNS.
 - **Derived value**: Add formula to `decoder.py` → `calculate_derived()`, then add column to CSV_COLUMNS with a `"cmd": None` entry in `pids.py`.
 - **Metadata**: Just add to CSV_COLUMNS and populate in `logger.py` → `build_row()`.
 
@@ -81,7 +81,7 @@ The XC90 Logger has **three places** that must agree on column schema:
 
 ```
 1. logger.py   → CSV_COLUMNS list (append new column at logical position)
-2. code.gs     → CSV_HEADERS array (append in exact same position)
+2. deploy/code.gs → CSV_HEADERS array (append in exact same position)
 3. logger.py   → build_row() return dict (add the new key:value)
 ```
 
@@ -92,7 +92,7 @@ Update `FW_VERSION` in `config.py`. This is logged in every row so you know whic
 ### Step 4: Deploy
 
 1. Flash updated firmware to ESP32
-2. Deploy updated `code.gs` to Google Apps Script
+2. Deploy updated `deploy/code.gs` to Google Apps Script
 3. The next POST will overwrite the sheet's header row with the new schema
 4. Old rows from previous firwmare will have empty values for new columns (forward-filled by SensorState)
 
@@ -110,7 +110,7 @@ Check the Google Sheet after the first upload:
 Same process as adding, but:
 
 1. Remove from `CSV_COLUMNS` in `logger.py`
-2. Remove from `CSV_HEADERS` in `code.gs`
+2. Remove from `CSV_HEADERS` in `deploy/code.gs`
 3. Remove from `build_row()` in `logger.py`
 4. Remove PID definition from `pids.py` if applicable
 5. Bump `FW_VERSION`
@@ -129,7 +129,7 @@ Same process as adding, but:
 - `SensorState` forward-fills: if a PID hasn't been queried this cycle, its last known value is used
 - All columns always have a value (or empty string if never queried)
 
-### In Google Sheets (`code.gs`)
+### In Google Sheets (`deploy/code.gs`)
 
 - Header row is **overwritten on every POST** with `CSV_HEADERS`
 - Row data is mapped column-by-column using `CSV_HEADERS` as the key

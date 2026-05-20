@@ -182,15 +182,15 @@ You'll see output like:
 [obd] Found device: ANDROID-VLINK
 [obd] Connecting...
 [obd] Connected to iCar Pro
-[sampler:critical] Started — interval 1.0s
-[sampler:standard] Started — interval 2.0s
-[sampler:slow] Started — interval 5.0s
-[sampler:enhanced] Started — interval 10.0s
-[trip] Monitor started
+[sampler] Sequential sampler started — 1 row/1s
+[sampler] Critical: 4 PIDs every cycle
+[sampler] Standard: 10 PIDs every 2nd cycle
+[sampler] Slow: 8 PIDs every 5th cycle
 [upload] Task started
 [conn] Monitor started
 [logger] Trip started: XC90_20260507_180532
 [logger] Flushed 50 rows → /logs/xc90_001.csv
+[trip] Flushing buffer on trip end
 ...
 ```
 
@@ -237,7 +237,7 @@ You'll see output like:
 - ✅ uploader.py (WiFi & Google Sheets)
 - ✅ main.py (Main entry point)
 
-**Total size:** ~45KB (easily fits in ESP32-S3 flash)
+**Total size:** ~50KB (easily fits in ESP32-S3 flash)
 
 ---
 

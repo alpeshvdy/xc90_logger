@@ -9,9 +9,8 @@
 
 Validate that the ESP32 logger:
 - Connects to iCar Pro BLE adapter
-- Runs the PID probe successfully
 - Detects trip start/end from RPM
-- Queries all 4 tiers (critical, standard, slow, enhanced)
+- Queries all 3 tiers via sequential sampler
 - Writes valid CSV rows to flash
 - Survives the full session without crashing
 
@@ -126,43 +125,21 @@ mpremote run main.py
 [obd] ATAT1 → OK
 [obd] ATST32 → OK
 [obd] AT init complete
-[obd] No probe file — will run on first boot
 [obd] Ready for OBD queries
-[boot] First boot — running PID probe
-[boot] Engine must be running for probe
 [boot] Checking for pending uploads...
 [uploader] No WiFi — skipping upload
 [boot] Boot complete
 
-[sampler:critical] Started — interval 1.0s
-[sampler:standard] Started — interval 2.0s
-[sampler:slow] Started — interval 5.0s
-[sampler:enhanced] Started — interval 10.0s
-[trip] Monitor started
+[sampler] Sequential sampler started — 1 row/1s
+[sampler] Critical: 4 PIDs every cycle
+[sampler] Standard: 10 PIDs every 2nd cycle
+[sampler] Slow: 8 PIDs every 5th cycle
 [upload] Task started
 [conn] Monitor started
-[main] 7 tasks running
+[main] 3 tasks running
 ```
 
-### ⚠️ Critical Check #1 — PID Probe Warning
-
-The boot message says **"Engine must be running for probe"**. With engine OFF, the PID probe may fail for enhanced PIDs. This is **expected** — we'll check the probe results after engine start.
-
-If you see:
-```
-[obd] ? boost_target_kpa: no_data       ← Expected with engine off
-[obd] ? turbo_inlet_pres: no_data       ← Expected with engine off  
-[obd] ? oil_pressure_kpa: no_data       ← Expected with engine off
-```
-→ Normal. The ECU doesn't broadcast enhanced PIDs with engine off.
-
-If you see:
-```
-[obd] ✗ boost_target_kpa: unsupported   ← May be real or engine-off artifact
-```
-→ Note this, we'll retry after engine start.
-
-### ⚠️ Critical Check #2 — Trip Detection
+### ⚠️ Critical Check #1 — Trip Detection
 
 With engine OFF, RPM should be 0:
 
@@ -189,9 +166,10 @@ If this does NOT appear within 3 seconds of engine start, note it — the `TRIP_
 ### Expected: Sampler Output (within 10 seconds)
 
 ```
-[sampler:critical] querying: rpm, coolant_temp_c, boost_actual_kpa, vehicle_speed_kph
-[sampler:standard] querying: engine_load_pct, throttle_pos_pct, stft_pct, ...
+[sampler] Sequential sampler started — 1 row/1s
 ```
+
+Rows will be written to CSV with all forward-filled columns. Standard PIDs fill in on even cycles, slow PIDs on every 5th cycle.
 
 ---
 
@@ -290,7 +268,7 @@ After `TRIP_END_DELAY` seconds (default: 10 seconds of RPM=0):
 [logger] Flushed XX rows → /logs/xc90_001.csv
 ```
 
-### ⚠️ Critical Check #3 — Trip End
+### ⚠️ Critical Check #2 — Trip End
 
 If you do NOT see "Trip ended" within 15 seconds of engine off:
 → `TRIP_END_RPM` or `TRIP_END_DELAY` may need tuning.
@@ -310,8 +288,8 @@ Open it in Excel / Google Sheets / VS Code.
 ### CSV Validation Checklist
 
 ```
-☐ File has a header row (31 columns)
-☐ At least 50+ data rows (10 minutes × 6+ samples/sec)
+☐ File has a header row (37 columns)
+☐ At least 600+ data rows (10 minutes × 1 row/sec)
 ☐ Column "trip_id" is the same throughout
 ☐ Column "trip_sequence" counts up 1,2,3... without gaps
 ☐ "rpm" column:
@@ -325,51 +303,13 @@ Open it in Excel / Google Sheets / VS Code.
 ☐ "drive_phase" is mostly "idle" (you're in Park)
 ☐ "coolant_temp_c" rises slowly throughout the test
 ☐ "throttle_pos_pct" correlates with your blips
-☐ No column is entirely empty (except possibly enhanced PIDs)
+☐ All standard PIDs have values (not empty); slow PIDs fill in every 5th row
 ☐ No obviously impossible values (negative RPM, speed>0, etc.)
 ```
 
 ---
 
-## Step 8 — Check the PID Probe Results
-
-```bash
-mpremote cp /logs/pid_probe.json .
-cat pid_probe.json
-```
-
-Expected structure:
-```json
-{
-  "boost_target_kpa": "ok",        ← or "unsupported" / "no_data"
-  "boost_delta_kpa": "derived",    ← always derived
-  "turbo_inlet_pres": "ok",        ← or "unsupported" / "no_data"  
-  "oil_pressure_kpa": "ok"         ← or "unsupported" / "no_data"
-}
-```
-
-| Probe Result | Meaning | Action |
-|-------------|---------|--------|
-| `"ok"` | PID works on your ECU | Keep it in ENHANCED_PIDS |
-| `"unsupported"` | Your ECU doesn't have this PID | Remove from ENHANCED_PIDS |
-| `"no_data"` | Engine was probably off during probe | Run probe again with engine running |
-| `"error"` | Communication failure | Check BLE connection, retry |
-| `"derived"` | Calculated, not queried. Normal. | Keep as-is |
-
-If any enhanced PID shows `"no_data"` — the probe ran with engine off. Delete `pid_probe.json` and restart main.py with engine running:
-
-```bash
-mpremote run main.py
-# OR if you already have a REPL session:
-# Ctrl+C to stop, then:
-import os
-os.remove("/logs/pid_probe.json")
-# Then restart main.py
-```
-
----
-
-## Step 9 — Test WiFi Upload (Optional, If Near Your WiFi)
+## Step 8 — Test WiFi Upload (Optional, If Near Your WiFi)
 
 After the trip ends, the upload task runs every 5 minutes. Or you can trigger manually:
 
@@ -402,27 +342,26 @@ Then check your Google Sheet for data.
 ☐ AT init sequence completes (all 8 commands respond)
 ☐ "Trip started" appears within 3 seconds of engine start
 ☐ RPM values are plausible (0→~800→blips→0)
-☐ All standard PIDs return values (not "NO DATA")
+☐ All PIDs return values (not "NO DATA") when applicable
 ☐ "Trip ended" appears within 15 seconds of engine off
-☐ CSV file is written to /logs/ with header + data rows
-☐ CSV contains at least 50 rows
+☐ CSV file is written to /logs/ with header + 37 data columns
+☐ CSV contains at least 600 rows (10 min × 1 row/sec)
 ☐ Logger doesn't crash or freeze during 10+ minute test
 ```
 
 ### ⚠️ PARTIAL PASS — Note these but can deploy
 
 ```
-☐ Some enhanced PIDs show "unsupported" (ECU variant doesn't have them)
-☐ PID probe ran with engine off (re-run with engine running)
 ☐ WiFi upload skipped (no WiFi at test location — expected)
 ☐ Buffer didn't fill to BUFFER_SIZE (test too short — normal)
+☐ Some slow PIDs only populated every 5th row (expected — forward-filling)
 ```
 
 ### ❌ FAIL — Must fix before driving test
 
 ```
 ☐ Logger crashes with Python traceback
-☐ iCar Pro never found (check device name in config.py)
+☐ iCar Pro never found (check BLE auto-discovery settings in config.py)
 ☐ AT init fails (check iCar Pro firmware version)
 ☐ Trip never starts (TRIP_START_RPM too high?)
 ☐ Trip never ends (TRIP_END_DELAY too long?)
@@ -441,7 +380,6 @@ Then check your Google Sheet for data.
 | "Connection timed out" | iCar Pro too far from ESP32? Try closer. |
 | "ATZ → NO DATA" | iCar Pro needs power cycle. Unplug/replug. |
 | All PIDs "NO DATA" | Engine running? Key at position II? |
-| Enhanced PIDs all "NO DATA" | Engine running? These need ECU awake. |
 | RPM reads 0 when engine on | Wrong protocol? Check ATSP0 result. |
 | Trip doesn't start | TRIP_START_RPM may need lowering (try 50). |
 
@@ -449,11 +387,10 @@ Then check your Google Sheet for data.
 
 ## Post-Test — Before You Drive
 
-1. **Review CSV** — every column should have data
-2. **Run PID probe again** with engine running if first probe failed
-3. **Remove `pid_probe.json`** if you want a fresh probe on next boot
-4. **Commit the CSV** to your repo as a baseline reference
-5. **Follow `PID_VALIDATION_GUIDE.md`** to validate enhanced PIDs
+1. **Review CSV** — every column should have data where expected
+2. **Check forward-filling** — slow PIDs appear every 5th row, standard PIDs every 2nd row
+3. **Commit the CSV** to your repo as a baseline reference
+4. **Review `docs/SCHEMA.md`** to understand all 37 columns
 
 ---
 

@@ -1,13 +1,19 @@
 # --- Time ---
 UTC_OFFSET_HOURS = -5  # Toronto is UTC-5 (EST) or UTC-4 (EDT in summer)
 
-# WiFi credentials
-WIFI_SSID = "Rogers 77"
-WIFI_PASSWORD = "House@77"
+# --- Sensitive credentials — imported from secrets.py (gitignored) ---
+try:
+    from secrets import WIFI_SSID, WIFI_PASSWORD, SHEETS_WEBHOOK_URL, VIN_PARTIAL
+except ImportError:
+    # Fallback — copy secrets.example.py → secrets.py with your values
+    WIFI_SSID = ""
+    WIFI_PASSWORD = ""
+    SHEETS_WEBHOOK_URL = ""
+    VIN_PARTIAL = ""
+
 WIFI_TIMEOUT = 10  # seconds to wait before giving up
 
 # Google Sheets
-SHEETS_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbwIYHoQsp1Y3kt4XaW0kg0tl0T3D6GMdORwxyJ-sSSWVdFjExO4zFJ407dW6dRMKWBQ/exec"
 SHEETS_TIMEOUT = 5  # seconds before giving up on upload
 
 # BLE / iCar Pro
@@ -68,6 +74,5 @@ BUFFER_SIZE = 50                     # rows to buffer in RAM before writing to f
 
 # Firmware
 FW_VERSION = "0.1.0"
-VIN_PARTIAL = "344148"  # replace with last 6 of your XC90 VIN
-                        # find it on dashboard near windscreen
+# VIN_PARTIAL is imported from secrets.py above
 

@@ -6,13 +6,16 @@
 #        Or from repo: cd xc90_logger && python tools/boot_test.py
 # ============================================================
 
-import os
 import sys
 
-# Allow running from tools/ subdirectory on PC
-_p = os.path.join(os.path.dirname(__file__), '..')
-if _p not in sys.path:
-    sys.path.insert(0, _p)
+# Allow running from tools/ subdirectory on PC (os.path doesn't exist in MicroPython)
+try:
+    import os as _os
+    _p = _os.path.join(_os.path.dirname(__file__), '..')
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+except AttributeError:
+    pass  # MicroPython — all imports are already in sys.path
 
 print("\n" + "="*50)
 print(" XC90 Logger — Pre-Flight Validation")

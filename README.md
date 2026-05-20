@@ -28,18 +28,8 @@ xc90_logger/
 ├── deploy/                # Google Sheets integration
 │   └── code.gs            # Apps Script webhook receiver
 │
-├── hw/                    # Hardware config + Wokwi simulator
-│   ├── wokwi.toml
-│   ├── wokwi_test.py
-│   ├── diagram.json
-│   ├── ESP32-S3-WROOM-1_REFERENCE.md
-│   └── firmware-LOLIN_S3-v1.28.0-212-gbb9e675cf1.bin
-│
-├── tests/                 # Unit tests (run on PC with pytest)
-│   ├── test_decoder.py
-│   ├── test_logger.py
-│   ├── test_uploader.py
-│   └── mocks.py
+├── hw/                    # Hardware reference
+│   └── ESP32-S3-WROOM-1_REFERENCE.md
 │
 ├── tools/                 # PC-side diagnostic utilities
 │   ├── test_webhook.py                # Test Google Sheets webhook
@@ -48,9 +38,6 @@ xc90_logger/
 │   ├── troubleshoot_connection.py     # USB connection diagnostics
 │   ├── ble_scan_debug.py              # Raw BLE advertisement scanner
 │   └── first_try.py                   # Early BLE exploration script
-│
-└── data/                  # Sample data
-    └── xc90_001.csv       # Sample log output
 ```
 
 ## Quick Start
@@ -72,4 +59,5 @@ XC90 ECU → iCar Pro BLE → ESP32 → CSV on flash → WiFi → Google Sheets
 ## Schema
 
 37 columns, one dense row per second. All columns forward-filled for AI readiness.
+18 PIDs queried from ECU (Mode 01 only) + 2 derived PIDs = 20 data values across 37 CSV columns.
 See `docs/SCHEMA.md` for column details and evolution rules.

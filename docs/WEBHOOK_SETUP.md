@@ -11,15 +11,9 @@
 
 ## Step 2: Create Sheet Tab
 1. In Google Sheet, create a new tab (sheet) named: `XC90_Logs`
-2. Add headers in first row - copy from CSV_COLUMNS in logger.py:
-   
-   timestamp_utc | timestamp_local | trip_id | trip_sequence | session_odometer | 
-   engine_state | drive_phase | rpm | coolant_temp_c | boost_actual_kpa | 
-   vehicle_speed_kph | engine_load_pct | throttle_pos_pct | stft_pct | ltft_pct | 
-   maf_g_s | intake_air_temp_c | intake_manifold_pres | oil_temp_c | battery_voltage_v | 
-   baro_pressure_kpa | fuel_trim_sum | boost_target_kpa | boost_delta_kpa | 
-   turbo_inlet_pres | oil_pressure_kpa | raw_pid | raw_response | decode_status | 
-   sample_tier | fw_version | vin_partial
+2. Headers are automatically written by the Apps Script on every POST.
+   The full schema (37 columns) is defined in `deploy/code.gs` → `CSV_HEADERS`.
+   See `docs/SCHEMA.md` for the complete column reference.
 
 ## Step 3: Update Apps Script
 1. Go back to Apps Script editor (Extensions → Apps Script)
