@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>XC90 Logger — Dashboard</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+</head>
+<body>
+  <div class="app">
+
+    <!-- Header -->
+    <header class="header">
+      <h1>XC90 Logger</h1>
+      <span class="header-sub">OBD-II Telemetry Dashboard</span>
+    </header>
+
+    <!-- Config Panel -->
+    <section class="config-panel" id="config-panel">
+      <div class="config-row">
+        <label for="sheet-id">Google Sheet ID</label>
+        <input type="text" id="sheet-id" placeholder="1x410PkWqVuKIS8Dq5XZfnkwocMwZ6ISID5oFtmfKYcU" spellcheck="false">
+        <label for="sheet-name">Tab Name</label>
+        <input type="text" id="sheet-name" value="XC90_Logs" spellcheck="false">
+        <button id="btn-load">Load Data</button>
+        <span class="config-hint">Sheet must be shared: <em>Anyone with the link can view</em></span>
+      </div>
+    </section>
+
+    <!-- Status Bar -->
+    <div class="status-bar" id="status-bar">
+      <span id="status-text">Enter your Google Sheet ID and click Load Data</span>
+      <span id="status-meta"></span>
+    </div>
+
+    <!-- Gauges Row -->
+    <section class="gauges-row" id="gauges-row">
+      <div class="gauge-card">
+        <canvas id="gauge-rpm"></canvas>
+        <span class="gauge-label">RPM</span>
+      </div>
+      <div class="gauge-card">
+        <canvas id="gauge-coolant"></canvas>
+        <span class="gauge-label">Coolant °C</span>
+      </div>
+      <div class="gauge-card">
+        <canvas id="gauge-boost"></canvas>
+        <span class="gauge-label">Boost kPa</span>
+      </div>
+      <div class="gauge-card">
+        <canvas id="gauge-speed"></canvas>
+        <span class="gauge-label">Speed km/h</span>
+      </div>
+      <div class="gauge-card">
+        <canvas id="gauge-battery"></canvas>
+        <span class="gauge-label">Battery V</span>
+      </div>
+    </section>
+
+    <!-- Trip List -->
+    <section class="panel" id="trip-list-panel">
+      <div class="panel-header">
+        <h2>Trips</h2>
+        <button id="btn-trends" class="btn-secondary">30-Day Trends</button>
+      </div>
+      <div class="trip-table-wrap">
+        <table id="trip-table">
+          <thead>
+            <tr>
+              <th>Trip ID</th>
+              <th>Date</th>
+              <th>Duration</th>
+              <th>Distance (km)</th>
+              <th>Max RPM</th>
+              <th>Max Boost (kPa)</th>
+              <th>Max Speed (km/h)</th>
+              <th>Avg Coolant (°C)</th>
+              <th>Rows</th>
+            </tr>
+          </thead>
+          <tbody id="trip-tbody">
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Trip Detail Charts -->
+    <section class="panel" id="trip-detail-panel" style="display:none;">
+      <div class="panel-header">
+        <h2 id="trip-detail-title">Trip Detail</h2>
+        <button id="btn-back" class="btn-secondary">← Back to Trips</button>
+      </div>
+      <div class="phase-bar" id="phase-bar"></div>
+      <div class="charts-grid">
+        <div class="chart-card">
+          <canvas id="chart-rpm"></canvas>
+        </div>
+        <div class="chart-card">
+          <canvas id="chart-boost-speed"></canvas>
+        </div>
+        <div class="chart-card">
+          <canvas id="chart-coolant-iat"></canvas>
+        </div>
+        <div class="chart-card">
+          <canvas id="chart-fuel-trims"></canvas>
+        </div>
+        <div class="chart-card chart-card-full">
+          <canvas id="chart-throttle-load"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Trends Panel -->
+    <section class="panel" id="trends-panel" style="display:none;">
+      <div class="panel-header">
+        <h2>30-Day Trends</h2>
+        <button id="btn-back-trends" class="btn-secondary">← Back to Trips</button>
+      </div>
+      <div class="charts-grid">
+        <div class="chart-card chart-card-full">
+          <canvas id="chart-trend-coolant"></canvas>
+        </div>
+        <div class="chart-card chart-card-full">
+          <canvas id="chart-trend-battery"></canvas>
+        </div>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+      XC90 Logger Dashboard &mdash; Data via Google Sheets &mdash; <span id="footer-updated">--</span>
+    </footer>
+
+  </div>
+
+  <script src="dashboard.js"></script>
+</body>
+</html>
